@@ -2,7 +2,7 @@
 """Fail closed: compiling is not independent benchmark certification."""
 import hashlib,json,pathlib,re,sys
 root=pathlib.Path(__file__).resolve().parents[1]
-required=["source/upstream.sha","source/patch-series.txt","source/RELEASE_APPROVED.json","LICENSE"]
+required=["source/upstream.sha","source/patch-series.txt","source/RELEASE_APPROVED.json","LICENSE","THIRD_PARTY_NOTICES.md"]
 missing=[x for x in required if not (root/x).is_file()]
 if missing:
     sys.exit("Release BLOCKED. Owner-reviewed requirements missing: "+", ".join(missing))
