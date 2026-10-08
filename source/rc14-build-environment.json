@@ -1,0 +1,42 @@
+{
+  "purpose": "Historical rc14 native build options and the toolchain that produced/verified the recovered source. Toolchain equality is necessary but not sufficient for binary identity.",
+  "historical_build": {
+    "arch": "arm64",
+    "deployment_target": "12.0",
+    "generator": "Ninja",
+    "build_type": "Release",
+    "source": "release/build-rc.sh",
+    "cmake_options": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_OSX_ARCHITECTURES": "arm64",
+      "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0",
+      "GGML_NATIVE": "OFF",
+      "GGML_METAL": "ON",
+      "GGML_METAL_EMBED_LIBRARY": "ON",
+      "BUILD_SHARED_LIBS": "OFF",
+      "LLAMA_CURL": "OFF",
+      "LLAMA_OPENSSL": "OFF",
+      "LLAMA_BUILD_TESTS": "OFF",
+      "LLAMA_BUILD_TOOLS": "ON",
+      "LLAMA_BUILD_SERVER": "ON",
+      "GGML_CCACHE": "OFF"
+    }
+  },
+  "recorded_rc14_identities": {
+    "paging_source_sha256": "61ce135641e23f6170aaaf679c6eb6314bf5194c71df63af283f7449966729e7",
+    "benchmark_source_sha256": "b01eb9262871d28723d23c3c6fbd6f97649ea5dfb6ccffb295cf04acac783186",
+    "benchmark_binary_sha256": "20060dab868798a606ccb4755a47c329e82db603068c9a82a1c92279b9bed334",
+    "server_binary_sha256": "dbb27344f98264961d80de5149f08555da3fcdb2a9a31cbca58a884227efcfc9",
+    "selftest_binary_sha256": "25e6b26ea1ee5d33e5d72f711a2a601da2d53757e98cc059a8dd58c063d43463",
+    "cmake_cache_sha256": "2f2aee4f57bc7af5ba733f9a6f08b2be6ede7f8ed66b48bbe3a659b6c5d5fbf8",
+    "note": "Historical binaries are not published; these identities come from the private rc14 evidence and are recorded for audit, not as a claim that a fresh build reproduces them."
+  },
+  "verification_host": {
+    "macos": "26.5.1 (build 25F80)",
+    "apple_clang": "21.0.0 (clang-2100.1.1.101), target arm64-apple-darwin25.5.0",
+    "xcode": "not installed (active developer directory is Command Line Tools)",
+    "cmake": "4.4.3",
+    "ninja": "1.13.2",
+    "git": "2.50.1 (Apple Git-155)"
+  }
+}
