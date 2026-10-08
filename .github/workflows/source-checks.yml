@@ -1,0 +1,26 @@
+name: Public source checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate exported source
+        run: bash scripts/check-public.sh
+      - name: Report native-build readiness
+        shell: bash
+        run: |
+          if [[ -s source/upstream.sha && -s source/patch-series.txt ]]; then
+            echo "Upstream source lock provided; native build requires independent qualification."
+          else
+            echo "::notice::Native release is blocked until upstream SHA and patch series are verified."
+          fi

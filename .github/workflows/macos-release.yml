@@ -1,0 +1,49 @@
+name: macOS ARM64 source build and gated release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Source checks
+        run: bash scripts/check-public.sh
+      - name: Require immutable source pin and rebuild source tree
+        run: bash scripts/bootstrap-upstream.sh
+      - name: Install build tools
+        run: brew install cmake ninja
+      - name: Build macOS arm64 executable
+        run: bash release/build-rc.sh
+      - name: Verify executable architecture
+        shell: bash
+        run: |
+          file llama.cpp/build-m1-rc/bin/llama-server
+          file llama.cpp/build-m1-rc/bin/llama-server | grep arm64
+          otool -L llama.cpp/build-m1-rc/bin/llama-server
+      - name: Package and checksum
+        run: bash scripts/package-public.sh
+      - name: Upload development build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-virtual-memory-arm64-development
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+      - name: Verify owner-approved release qualification
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python3 scripts/check-release-gate.py
+      - name: Publish tag after qualification
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --title "MoE Virtual Memory $GITHUB_REF_NAME" \
+            --notes-file docs/benchmarks.md --prerelease
