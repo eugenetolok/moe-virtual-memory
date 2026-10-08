@@ -1,0 +1,303 @@
+diff --git a/src/llama-moe-paging.h b/src/llama-moe-paging.h
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -147,6 +147,9 @@
+     // predictor placement lead: A0-ready -> authoritative demand
+     double                a0_ready_ms = 0.0;
+ 
++    // Execution 016: one joinable read set per speculative expert. The batch
++    // index per physical slot is -1 when the slot has no in-flight batch.
++    std::vector<int32_t>  slot_batch;
+ };
+ 
+ // Idempotent. Reads the env vars:
+@@ -214,6 +217,11 @@
+ bool llama_moe_paging_prefetch_oracle_mode();
+ int  llama_moe_paging_prefetch_pool();
+ 
++// Execution 016: when set to 1, the speculative P reads are submitted as one
++// shared batch again (the Execution-015 behavior). Diagnostic compatibility mode
++// for the batch-path unit test; default 0 = one batch per expert.
++bool llama_moe_paging_prefetch_shared_batch();
++
+ // Start marker: stamps the layer-start time and passes the layer input through.
+ void llama_moe_paging_prefetch_start(ggml_tensor * dst, const ggml_tensor * a,
+                                      int ith, int nth, void * userdata);
+diff --git a/src/llama-moe-paging.cpp b/src/llama-moe-paging.cpp
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -97,7 +97,9 @@
+     size_t  size = 0;
+ };
+ 
+-// Execution 015: one in-flight speculative read set.
++// Execution 015/016: one in-flight speculative read set. Execution 016 submits
++// one such batch per speculative expert, so a demand join waits only for the
++// expert it actually requested.
+ struct prefetch_batch {
+     std::unique_ptr<read_pending> p;
+     std::vector<int32_t> slots;
+@@ -216,12 +218,35 @@
+     uint64_t pf_shadow_useful = 0;
+     uint64_t pf_shadow_misses = 0;
+     uint64_t pf_shadow_cand = 0;
++    // Canonical authoritative demand-side I/O blocking wait. Both the
++    // demand-only path and the protected-prefetch path accumulate per layer event.
++    double   demand_blocking_wait_ms = 0.0;
++    uint64_t demand_wait_events = 0;
++    // Execution 016 join isolation
++    uint64_t pf_expert_batches = 0;
++    uint64_t pf_join_batches = 0;
++    uint64_t pf_join_wait_us_n = 0;
++    double   pf_join_wait_ms = 0.0;
++    uint64_t pf_unrelated_active = 0;
++    uint64_t pf_ready_at_demand = 0;
++    uint64_t pf_loading_at_demand = 0;
++    uint64_t pf_shared_batches = 0;
++    std::vector<double> pf_join_wait_us;
++    bool     prefetch_shared = false;
++    uint64_t shadow_checks = 0;
++    uint64_t shadow_fail = 0;
+     uint64_t pf_occupancy_sum = 0;
+     uint64_t demand_occupancy_sum = 0;
+     uint64_t occupancy_samples = 0;
+     std::vector<double> pf_lead_us;
+     std::vector<double> a0_lead_us;
+     std::vector<std::vector<prefetch_batch>> pf_batches;
++
++    // Execution 016 C1: diagnostic ordered hash over (token_event, layer,
++    // expert_id) of every successfully submitted speculative expert.
++    uint64_t pf_seq_hash = 1469598103934665603ULL;
++    uint64_t pf_seq_n = 0;
++    FILE *   pf_seq_f = nullptr;
+ 
+     // worker pool. High-priority (demand) tasks are always drained first.
+     std::mutex mtx;
+@@ -565,18 +590,40 @@
+         double idx = q * (double) (a0l_sorted.size() - 1);
+         return a0l_sorted[(size_t) idx];
+     };
++    // Execution 016 P0: a real prefetch=off run must emit the canonical
++    // demand-only fields. The hot path never populates the logical_* counters
++    // when prefetch is off, so derive them here at serialization. Assignment is
++    // idempotent: in demand-only mode nothing else writes these counters.
++    const bool demand_only = !g.prefetch_enabled;
++    if (demand_only) {
++        g.logical_hits = hits;
++        g.logical_misses = misses;
++        g.demand_read_bytes = (uint64_t) misses * (uint64_t) g.record_stride;
++        g.prefetch_read_bytes = 0;
++    }
+     // Canonical byte accounting. Under protected probation demand_read_bytes only
+     // counts reads the probation did not serve, so it is not the demand-only
+     // baseline. The demand-only baseline is the logical demand miss set.
+     const uint64_t logical_demand_bytes =
+         (uint64_t) g.logical_misses * (uint64_t) g.record_stride;
+     const uint64_t total_read_bytes = g.demand_read_bytes + g.prefetch_read_bytes;
+-    const double total_bytes_ratio = logical_demand_bytes > 0
+-        ? (double) total_read_bytes / (double) logical_demand_bytes : 0.0;
++    const double total_bytes_ratio = demand_only ? 1.0
++        : (logical_demand_bytes > 0
++            ? (double) total_read_bytes / (double) logical_demand_bytes : 0.0);
+     const double over_demand_ratio = g.demand_read_bytes > 0
+         ? (double) total_read_bytes / (double) g.demand_read_bytes : 0.0;
+     const double mean_occupancy = g.occupancy_samples > 0
+         ? (double) g.pf_occupancy_sum / (double) g.occupancy_samples : 0.0;
++
++    std::vector<double> jw_sorted = g.pf_join_wait_us;
++    std::sort(jw_sorted.begin(), jw_sorted.end());
++    auto jw_pct = [&](double q) -> double {
++        if (jw_sorted.empty()) {
++            return 0.0;
++        }
++        double idx = q * (double) (jw_sorted.size() - 1);
++        return jw_sorted[(size_t) idx];
++    };
+ 
+     fprintf(f, "{\n");
+     fprintf(f, " \"mode\": \"cpu_hybrid_staging_paging\",\n");
+@@ -650,6 +697,23 @@
+     fprintf(f, " \"prefetch_shadow_useful\": %llu,\n", (unsigned long long) g.pf_shadow_useful);
+     fprintf(f, " \"prefetch_shadow_misses\": %llu,\n", (unsigned long long) g.pf_shadow_misses);
+     fprintf(f, " \"prefetch_shadow_candidates\": %llu,\n", (unsigned long long) g.pf_shadow_cand);
++    fprintf(f, " \"demand_blocking_wait_ms\": %.3f,\n", g.demand_blocking_wait_ms);
++    fprintf(f, " \"demand_blocking_wait_events\": %llu,\n", (unsigned long long) g.demand_wait_events);
++    fprintf(f, " \"demand_blocking_wait_ms_per_event\": %.4f,\n",
++            g.demand_wait_events > 0 ? g.demand_blocking_wait_ms / (double) g.demand_wait_events : 0.0);
++    fprintf(f, " \"prefetch_expert_batches_submitted\": %llu,\n", (unsigned long long) g.pf_expert_batches);
++    fprintf(f, " \"prefetch_join_batches\": %llu,\n", (unsigned long long) g.pf_join_batches);
++    fprintf(f, " \"prefetch_join_wait_ms\": %.3f,\n", g.pf_join_wait_ms);
++    fprintf(f, " \"prefetch_join_wait_us_p50\": %.3f,\n", jw_pct(0.50));
++    fprintf(f, " \"prefetch_join_wait_us_p95\": %.3f,\n", jw_pct(0.95));
++    fprintf(f, " \"prefetch_unrelated_batches_still_active_at_join\": %llu,\n", (unsigned long long) g.pf_unrelated_active);
++    fprintf(f, " \"prefetch_ready_at_demand\": %llu,\n", (unsigned long long) g.pf_ready_at_demand);
++    fprintf(f, " \"prefetch_loading_at_demand\": %llu,\n", (unsigned long long) g.pf_loading_at_demand);
++    fprintf(f, " \"prefetch_shared_batches_submitted\": %llu,\n", (unsigned long long) g.pf_shared_batches);
++    fprintf(f, " \"prefetch_shared_batch_mode\": %s,\n", g.prefetch_shared ? "true" : "false");
++    // Execution 016 C1: ordered identity hash of submitted speculative experts.
++    fprintf(f, " \"prefetch_submitted_seq_hash\": \"%016llx\",\n", (unsigned long long) g.pf_seq_hash);
++    fprintf(f, " \"prefetch_submitted_seq_n\": %llu,\n", (unsigned long long) g.pf_seq_n);
+     fprintf(f, " \"prefetch_lead_us_p50\": %.3f,\n", pfl_pct(0.50));
+     fprintf(f, " \"prefetch_lead_us_p95\": %.3f,\n", pfl_pct(0.95));
+     fprintf(f, " \"predictor_lead_us_p50\": %.3f,\n", a0l_pct(0.50));
+@@ -765,6 +829,10 @@
+ void atexit_handler() {
+     pool_stop();
+     oracle_capture_close();
++    if (g.pf_seq_f != nullptr) {
++        fclose(g.pf_seq_f);
++        g.pf_seq_f = nullptr;
++    }
+     dump_stats();
+ }
+ 
+@@ -963,10 +1031,12 @@
+ // Mark one completed speculative batch. Returns the number of slots that are
+ // still in-flight after this batch closed; zero means the layer has no
+ // outstanding speculative read left. Does not wait.
+-void prefetch_close_batch(llama_moe_paging_layer & l, std::vector<prefetch_batch>::iterator it) {
++int prefetch_close_batch(llama_moe_paging_layer & l, std::vector<prefetch_batch>::iterator it) {
+     const bool ok = it->p->submitted ? it->p->ok : true;
+-    const int32_t s = it->slot;
+-    {
++    for (const int32_t s : it->slots) {
++        if (s >= 0 && s < (int32_t) l.slot_batch.size()) {
++            l.slot_batch[s] = -1;
++        }
+         if (l.slot_state[s] != ST_LOADING) {
+             continue;
+         }
+@@ -980,6 +1050,11 @@
+         }
+     }
+     g.pf_batches[l.il].erase(it);
++    int active = 0;
++    for (const auto & b : g.pf_batches[l.il]) {
++        active += (int) b.slots.size();
++    }
++    return active;
+ }
+ 
+ // Drop completed prefetch batches. Does not wait.
+@@ -993,6 +1068,10 @@
+         }
+         if (it->p->async) {
+             it->p->ok = !it->p->batch.failed.load();
++            // Execution 016: the worker that completed the last task may still
++            // hold batch.m while remaining is already zero. Take the lock so the
++            // batch and its mutex are not erased under that worker.
++            std::lock_guard<std::mutex> lk(it->p->batch.m);
+         }
+         prefetch_close_batch(l, it);
+     }
+@@ -1060,6 +1139,14 @@
+     return n;
+ }
+ 
++// Execution 016 C1: FNV-1a over one submitted (token_event, layer, expert_id).
++void pf_seq_mix(uint64_t & h, uint64_t v) {
++    for (int b = 0; b < 8; b++) {
++        h ^= (v >> (8 * b)) & 0xffu;
++        h *= 1099511628211ULL;
++    }
++}
++
+ // Submit the selected candidates. Execution 016 keeps one independently joinable
+ // low-priority batch per expert, so a demand join waits only for its own expert.
+ // LLAMA_MOE_PAGING_PREFETCH_SHARED=1 restores the single shared batch for the
+@@ -1072,6 +1159,73 @@
+         g.pf_skipped_busy += (uint64_t) n;
+         return;
+     }
++    // Execution 016: one batch per speculative expert. Each batch is joinable
++    // on its own, so a demand event waits only for the expert it asked for while
++    // the other speculative reads stay on the low-priority queue.
++    // LLAMA_MOE_PAGING_PREFETCH_SHARED=1 restores one shared batch
++    // (Execution 015 behavior) for the equivalence check.
++    struct submit_group {
++        std::vector<int32_t> slots;
++        std::vector<io_task> tasks;
++    };
++    std::vector<submit_group> groups;
++    for (int i = 0; i < n; i++) {
++        const int s = find_empty_slot(l);
++        if (s < 0) {
++            g.pf_skipped_busy++;
++            continue;
++        }
++        l.slot_expert[s] = cand[i];
++        l.slot_state[s] = ST_LOADING;
++        l.pf_submit_ms[s] = now_ms();
++        std::vector<io_task> etasks;
++        build_read_tasks(l, cand[i], s, etasks);
++        size_t bytes = 0;
++        for (const auto & t : etasks) {
++            bytes += t.size;
++        }
++        g.pf_submitted_bytes += (uint64_t) bytes;
++        g.prefetch_read_bytes += (uint64_t) g.record_stride;
++        g.pf_submitted_experts++;
++        // Diagnostic identity hash, in exact submission order.
++        pf_seq_mix(g.pf_seq_hash, (uint64_t) g.tokens);
++        pf_seq_mix(g.pf_seq_hash, (uint64_t) (uint32_t) l.il);
++        pf_seq_mix(g.pf_seq_hash, (uint64_t) (uint32_t) cand[i]);
++        g.pf_seq_n++;
++        if (g.pf_seq_f != nullptr) {
++            fprintf(g.pf_seq_f, "%llu,%d,%d\n",
++                    (unsigned long long) g.tokens, l.il, cand[i]);
++        }
++        // Shared mode merges every expert into the first group; the default
++        // opens a new group per expert. Index, not a reference: push_back may
++        // reallocate and invalidate a reference held across the loop.
++        if (!g.prefetch_shared || groups.empty()) {
++            groups.emplace_back();
++        }
++        submit_group & grp = groups.back();
++        grp.slots.push_back(s);
++        for (auto & t : etasks) {
++            t.slot = s;
++            grp.tasks.push_back(t);
++        }
++    }
++    for (auto & grp : groups) {
++        auto p = std::make_unique<read_pending>();
++        submit_read_tasks(grp.tasks, *p, /*high=*/false);
++        prefetch_batch pb;
++        pb.p = std::move(p);
++        pb.slots = grp.slots;
++        for (const int32_t s : pb.slots) {
++            l.slot_batch[s] = (int32_t) g.pf_batches[l.il].size();
++        }
++        g.pf_batches[l.il].push_back(std::move(pb));
++        g.pf_expert_batches++;
++        if (g.prefetch_shared) {
++            g.pf_shared_batches++;
++        }
++    }
++}
++
+ // Layer-start A0 event: drop stale READY entries, then record or submit Top-P.
+ void prefetch_event(llama_moe_paging_layer & l, const int32_t * pool, int npool) {
+     prefetch_finalize(l);
+@@ -1842,6 +1996,10 @@
+         }
+         const double dw_wait = now_ms() - dw0;
+         if (!tasks.empty()) {
++            // Canonical demand-side blocking interval for the demand-only path.
++            // The protected-prefetch path adds to the same counters in stage_event_prefetch.
++            g.demand_blocking_wait_ms += dw_wait;
++            g.demand_wait_events++;
+             l.fault_ms += dw_wait;
+             l.read_wait_ms += dw_wait;
+             l.readset_wall_ms += dw_pre + dw_wait;
+@@ -2189,6 +2347,10 @@
+     g.prefetch_p = std::max(0, std::min(32, getenv_int("LLAMA_MOE_PAGING_PREFETCH_P", 0)));
+     g.prefetch_mode = getenv_str("LLAMA_MOE_PAGING_PREFETCH_MODE", "off");
+     g.prefetch_shared = getenv_bool("LLAMA_MOE_PAGING_PREFETCH_SHARED", false);
++    const char * pf_seq_path = getenv("LLAMA_MOE_PAGING_PREFETCH_SEQ");
++    if (pf_seq_path != nullptr && pf_seq_path[0] != '\0') {
++        g.pf_seq_f = fopen(pf_seq_path, "w");
++    }
+     g.prefetch_pool = std::max(1, std::min(64, getenv_int("LLAMA_MOE_PAGING_PREFETCH_K", 16)));
+     g.shadow_assert = g.assert_checks || getenv_bool("LLAMA_MOE_PAGING_SHADOW", false);
+     if (g.prefetch_p > 0 && g.prefetch_mode != "off") {

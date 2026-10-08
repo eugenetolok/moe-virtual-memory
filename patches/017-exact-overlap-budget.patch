@@ -1,0 +1,1129 @@
+diff --git a/src/llama-moe-paging.h b/src/llama-moe-paging.h
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -150,6 +150,23 @@
+     // Execution 016: one joinable read set per speculative expert. The batch
+     // index per physical slot is -1 when the slot has no in-flight batch.
+     std::vector<int32_t>  slot_batch;
++
++    // Execution 017 timeline stamps (steady_clock ms, 0 = not seen)
++    double tl_start_ms = 0.0;
++    double tl_a0_ms = 0.0;
++    double tl_router_ms = 0.0;
++    double tl_demand_submit_ms = 0.0;
++    double tl_demand_unblock_ms = 0.0;
++    double tl_shexp_start_ms = 0.0;
++    // correction 4: production projection outputs for the n-specific replay
++    ggml_tensor * tl_gate_out = nullptr;
++    ggml_tensor * tl_up_out = nullptr;
++    ggml_tensor * tl_down_out = nullptr;
++    // Execution 017 Part D: early resident compute overlap
++    const ggml_tensor * early_in = nullptr;
++    std::vector<float>   early_out;
++    bool                 early_ready[8] = {};
++    int                  early_n = 0;
+ };
+ 
+ // Idempotent. Reads the env vars:
+@@ -217,10 +234,16 @@
+ bool llama_moe_paging_prefetch_oracle_mode();
+ int  llama_moe_paging_prefetch_pool();
+ 
+-// Execution 016: when set to 1, the speculative P reads are submitted as one
+-// shared batch again (the Execution-015 behavior). Diagnostic compatibility mode
+-// for the batch-path unit test; default 0 = one batch per expert.
++// Execution 017: normal A0 submits the speculative P reads as one shared batch
++// (Execution-015 behavior), the default. Set LLAMA_MOE_PAGING_PREFETCH_SHARED=0
++// for the Execution-016 split diagnostic mode (one batch per expert).
+ bool llama_moe_paging_prefetch_shared_batch();
++
++// Execution 017 Part D: prototype overlap of ready resident-expert compute with the
++// authoritative cold reads. Disabled unless LLAMA_MOE_PAGING_OVERLAP=1.
++bool llama_moe_paging_overlap_enabled();
++void llama_moe_paging_early_input(ggml_tensor * dst, const ggml_tensor * a,
++                                  int ith, int nth, void * userdata);
+ 
+ // Start marker: stamps the layer-start time and passes the layer input through.
+ void llama_moe_paging_prefetch_start(ggml_tensor * dst, const ggml_tensor * a,
+diff --git a/src/llama-moe-paging.cpp b/src/llama-moe-paging.cpp
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -27,6 +27,9 @@
+ #include <unistd.h>
+ #include <vector>
+ 
++// Execution 017 correction 4: production CPU swiglu kernel (ggml-cpu/vec.cpp).
++extern "C" void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g);
++
+ // True when the resident-slot tensors are the compute storage (direct_sparse or
+ // direct_dense). Declared before the anonymous namespace: the early helpers use it.
+ namespace { bool llama_moe_paging_direct_storage(); }
+@@ -85,6 +88,18 @@
+     bool   submitted = false;
+     bool   async     = false;
+     bool   ok        = true;
++};
++
++// Execution 017 continuation: completion stamp for one speculative component,
++// so a LOADING expert promoted to demand can report gate/up/down completion
++// times even when the reads already finished before the demand event.
++struct tl_read_rec {
++    std::atomic<bool>   done{false};
++    std::atomic<double> done_ms{0.0};
++};
++
++struct tl_expert_rec {
++    tl_read_rec kind[4];
+ };
+ 
+ struct io_task {
+@@ -95,6 +110,8 @@
+     int     kind = READ_PACKED;
+     int64_t offset = 0;
+     size_t  size = 0;
++    uint64_t event_id = (uint64_t) -1;  // Execution 017 C4: owning demand event
++    tl_read_rec * tl_rec = nullptr;     // Execution 017 C4: speculative completion stamp
+ };
+ 
+ // Execution 015/016: one in-flight speculative read set. Execution 016 submits
+@@ -248,6 +265,104 @@
+     uint64_t pf_seq_n = 0;
+     FILE *   pf_seq_f = nullptr;
+ 
++    // Execution 017 measurement-only timeline. Everything here is inactive
++    // unless LLAMA_MOE_PAGING_TIMELINE=1, so the normal path is unchanged.
++    bool     timeline = false;
++    int      direct_bench = 0;          // n-sweep samples per projection, 0 = off
++    int      direct_bench_stride = 64;  // bench one op every N ops
++    int      tl_bench_now = 0;          // projection+1 for the current op, 0 = none
++    uint64_t tl_bench_done[3] = {};
++    std::vector<double> tl_bench_us[3][9];  // [proj][n selected] matmul samples
++    std::vector<double> tl_bench_conv_us[3][9];  // conversion-only replay samples
++    std::vector<double> tl_bench_full_us[3][9];  // conversion + matmul replay samples
++    double   tl_conv_ms[3] = {};            // measured from_float wall time
++    uint64_t tl_conv_n[3] = {};
++    uint64_t tl_layer_events = 0;
++    double   tl_a0_ms = 0.0;            // layer start to A0 ready
++    double   tl_attn_router_ms = 0.0;   // A0 ready to authoritative Top-K ready
++    double   tl_demand_io_ms = 0.0;     // Top-K ready to demand unblock
++    double   tl_expert_ms = 0.0;        // demand unblock to end marker
++    uint64_t tl_a0_n = 0;
++    uint64_t tl_attn_router_n = 0;
++    uint64_t tl_demand_io_n = 0;
++    uint64_t tl_expert_n = 0;
++    uint64_t tl_resident_sel = 0;       // selected experts already DEMAND-resident
++    uint64_t tl_ready_sel = 0;          // selected experts served by READY prefetch
++    uint64_t tl_loading_sel = 0;        // selected experts served by LOADING prefetch
++    uint64_t tl_ordinary_sel = 0;       // selected experts needing an ordinary read
++    uint64_t tl_resident_hist[9] = {};  // events with 0..8 resident selected experts
++    std::vector<int>    tl_event_resident;  // per event DEMAND-resident selected experts
++    std::vector<int>    tl_event_ready;     // per event PREFETCH_READY selected experts
++    std::vector<int>    tl_event_loading;   // per event PREFETCH_LOADING selected experts
++    std::vector<int>    tl_event_ordinary;  // per event ordinary-demand selected experts
++    std::vector<double> tl_event_expert_ms; // per event post-unblock -> routed end marker
++    std::vector<double> tl_event_op_gate_ms; // per event production gate matmul
++    std::vector<double> tl_event_op_up_ms;   // per event production up matmul
++    std::vector<double> tl_event_op_down_ms; // per event production down matmul
++    std::vector<double> tl_event_io_ms;     // per event authoritative demand block
++    uint64_t tl_requested_bytes = 0;    // exact selected component bytes per event
++    uint64_t tl_miss_gate_bytes = 0;
++    uint64_t tl_miss_up_bytes = 0;
++    uint64_t tl_miss_down_bytes = 0;
++    double   tl_op_ms[3] = {};          // direct hook wall time: gate/up/down
++    uint64_t tl_op_n[3] = {};
++    uint64_t tl_read_kind_n[4] = {};    // read latency by component kind
++    uint64_t tl_read_kind_hist[4][HIST_BUCKETS] = {};
++
++    // Execution 017 continuation: per-event phase/step tagging and correlated
++    // component completion records. All gated by g.timeline.
++    std::vector<uint64_t> tl_event_step;      // token-step index of each event
++    std::vector<double>   tl_event_a0_ms;     // A0 compute for this event (0 if none)
++    std::vector<double>   tl_event_attn_ms;   // A0-ready -> Top-K for this event
++    std::vector<double>   tl_event_submit_ms; // absolute demand-submit time
++    uint64_t tl_event_seq = 0;
++    // per-slot speculative completion stamp, survives batch close so a promoted
++    // LOADING expert can still report gate/up/down completion times
++    std::vector<std::vector<std::shared_ptr<tl_expert_rec>>> tl_slot_rec;
++
++    // C3 shared-expert graph markers (one per marked layer event)
++    uint64_t tl_shexp_n = 0;
++    double   tl_shexp_ms = 0.0;
++    std::vector<uint64_t> tl_shexp_step;
++    std::vector<double>   tl_shexp_ev_ms;
++    // correction 4: directly measured activation and routed-output replay
++    std::vector<double> tl_bench_act_us[9];
++    std::vector<double> tl_bench_out_us[9];
++    std::vector<double> tl_bench_first_us[3][9];  // first-touch matmul samples (before production)
++    int      tl_ft_now = 0;
++    int      tl_ft_n = 0;
++    uint64_t tl_ft_done[3][9] = {};
++    // Execution 017 Part D: prototype overlap of ready resident compute with cold reads
++    bool     overlap_enabled = false;
++    bool     overlap_verify = false;
++    bool     ov_skip = false;
++    uint64_t ov_events = 0;
++    uint64_t ov_experts = 0;
++    double   ov_ms = 0.0;
++    uint64_t ov_ready_before_unblock = 0;
++    uint64_t ov_ready_outstanding = 0;
++    uint64_t ov_dup_experts = 0;
++    double   ov_dup_ms = 0.0;
++    int64_t  ov_scratch_bytes = 0;
++    uint64_t ov_verify_pass = 0;
++    uint64_t ov_verify_fail = 0;
++    std::vector<float>   ov_fbuf;
++    std::vector<uint8_t> ov_inbuf;
++    std::vector<uint8_t> ov_actbuf;
++    std::vector<float>  tl_bench_scratch;
++    float tl_bench_scale = 1.0f;
++
++    // C4 correlated component completions (cold demand reads only)
++    struct tl_comp_rec {
++        uint64_t event;
++        int32_t  slot;
++        int32_t  gid;
++        uint8_t  kind;
++        double   done_ms;
++    };
++    std::mutex tl_comp_m;
++    std::vector<tl_comp_rec> tl_comp;
++
+     // worker pool. High-priority (demand) tasks are always drained first.
+     std::mutex mtx;
+     std::condition_variable cv_task;
+@@ -319,6 +434,20 @@
+ 
+ uint8_t * read_dst(llama_moe_paging_layer & l, int32_t slot, int kind);
+ 
++// Execution 017 continuation: publish the gate/up/down completion of a promoted
++// speculative expert to the owning demand event.
++void record_expert_components(uint64_t ev, const tl_expert_rec * rec, int32_t slot, int32_t gid) {
++    if (rec == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lk(g.tl_comp_m);
++    for (int kind = READ_GATE; kind <= READ_DOWN; kind++) {
++        if (rec->kind[kind].done.load()) {
++            g.tl_comp.push_back({ ev, slot, gid, (uint8_t) kind, rec->kind[kind].done_ms.load() });
++        }
++    }
++}
++
+ void run_one_task(const io_task & t) {
+ #if defined(LLAMA_MOE_PAGING_BATCH_SELFTEST)
+     if (getenv("LLAMA_MOE_PAGING_PREFETCH_BATCHSELFTEST") != nullptr) {
+@@ -329,10 +458,23 @@
+     uint8_t * buf = read_dst(*t.layer, t.slot, t.kind);
+     const double t0 = now_ms();
+     const bool ok = read_exact(fd, buf, t.size, (off_t) t.offset);
+-    const double dt = now_ms() - t0;
++    const double done_ms = now_ms();
++    const double dt = done_ms - t0;
++    if (g.timeline && t.tl_rec != nullptr) {
++        t.tl_rec->done_ms.store(done_ms);
++        t.tl_rec->done.store(true);
++    }
+     {
+         std::lock_guard<std::mutex> lk(g.hist_m);
+         hist_add(g.hist, dt);
++        if (g.timeline) {
++            hist_add(g.tl_read_kind_hist[t.kind], dt);
++            g.tl_read_kind_n[t.kind]++;
++        }
++    }
++    if (g.timeline && t.event_id != (uint64_t) -1) {
++        std::lock_guard<std::mutex> lk(g.tl_comp_m);
++        g.tl_comp.push_back({ t.event_id, t.slot, t.gid, (uint8_t) t.kind, done_ms });
+     }
+     read_batch * b = t.batch;
+     if (b != nullptr) {
+@@ -382,7 +524,12 @@
+             uint8_t * buf = read_dst(*t.layer, t.slot, t.kind);
+             const double t0 = now_ms();
+             const bool ok = read_exact(fd, buf, t.size, (off_t) t.offset);
+-            hist_add(g.hist, now_ms() - t0);
++            const double dt = now_ms() - t0;
++            hist_add(g.hist, dt);
++            if (g.timeline) {
++                hist_add(g.tl_read_kind_hist[t.kind], dt);
++                g.tl_read_kind_n[t.kind]++;
++            }
+             if (!ok) {
+                 return false;
+             }
+@@ -421,7 +568,12 @@
+             uint8_t * buf = read_dst(*t.layer, t.slot, t.kind);
+             const double r0 = now_ms();
+             const bool ok = read_exact(fd, buf, t.size, (off_t) t.offset);
+-            hist_add(g.hist, now_ms() - r0);
++            const double dt = now_ms() - r0;
++            hist_add(g.hist, dt);
++            if (g.timeline) {
++                hist_add(g.tl_read_kind_hist[t.kind], dt);
++                g.tl_read_kind_n[t.kind]++;
++            }
+             if (!ok) { p.ok = false; break; }
+         }
+         return;
+@@ -786,6 +938,215 @@
+         fprintf(f, "%s%llu", k ? ", " : "", (unsigned long long) miss_hist[k]);
+     }
+     fprintf(f, "],\n");
++    fprintf(f, " \"timeline\": %s,\n", g.timeline ? "true" : "false");
++    fprintf(f, " \"tl_layer_events\": %llu,\n", (unsigned long long) g.tl_layer_events);
++    fprintf(f, " \"tl_a0_ms\": %.3f,\n", g.tl_a0_ms);
++    fprintf(f, " \"tl_a0_ms_per_event\": %.4f,\n", g.tl_a0_n ? g.tl_a0_ms / (double) g.tl_a0_n : 0.0);
++    fprintf(f, " \"tl_attn_router_ms\": %.3f,\n", g.tl_attn_router_ms);
++    fprintf(f, " \"tl_attn_router_ms_per_event\": %.4f,\n",
++            g.tl_attn_router_n ? g.tl_attn_router_ms / (double) g.tl_attn_router_n : 0.0);
++    fprintf(f, " \"tl_demand_io_ms\": %.3f,\n", g.tl_demand_io_ms);
++    fprintf(f, " \"tl_demand_io_ms_per_event\": %.4f,\n",
++            g.tl_demand_io_n ? g.tl_demand_io_ms / (double) g.tl_demand_io_n : 0.0);
++    fprintf(f, " \"tl_expert_ms\": %.3f,\n", g.tl_expert_ms);
++    fprintf(f, " \"tl_expert_ms_per_event\": %.4f,\n",
++            g.tl_expert_n ? g.tl_expert_ms / (double) g.tl_expert_n : 0.0);
++    fprintf(f, " \"tl_a0_n\": %llu,\n", (unsigned long long) g.tl_a0_n);
++    fprintf(f, " \"tl_attn_router_n\": %llu,\n", (unsigned long long) g.tl_attn_router_n);
++    fprintf(f, " \"tl_demand_io_n\": %llu,\n", (unsigned long long) g.tl_demand_io_n);
++    fprintf(f, " \"tl_expert_n\": %llu,\n", (unsigned long long) g.tl_expert_n);
++    fprintf(f, " \"tl_resident_sel\": %llu,\n", (unsigned long long) g.tl_resident_sel);
++    fprintf(f, " \"tl_resident_sel_mean\": %.4f,\n",
++            g.tl_layer_events ? (double) g.tl_resident_sel / (double) g.tl_layer_events : 0.0);
++    fprintf(f, " \"tl_ready_sel\": %llu,\n", (unsigned long long) g.tl_ready_sel);
++    fprintf(f, " \"tl_loading_sel\": %llu,\n", (unsigned long long) g.tl_loading_sel);
++    fprintf(f, " \"tl_ordinary_sel\": %llu,\n", (unsigned long long) g.tl_ordinary_sel);
++    fprintf(f, " \"tl_requested_bytes\": %llu,\n", (unsigned long long) g.tl_requested_bytes);
++    fprintf(f, " \"tl_miss_gate_bytes\": %llu,\n", (unsigned long long) g.tl_miss_gate_bytes);
++    fprintf(f, " \"tl_miss_up_bytes\": %llu,\n", (unsigned long long) g.tl_miss_up_bytes);
++    fprintf(f, " \"tl_miss_down_bytes\": %llu,\n", (unsigned long long) g.tl_miss_down_bytes);
++    fprintf(f, " \"ov_events\": %llu,\n", (unsigned long long) g.ov_events);
++    fprintf(f, " \"ov_experts\": %llu,\n", (unsigned long long) g.ov_experts);
++    fprintf(f, " \"ov_ms\": %.3f,\n", g.ov_ms);
++    fprintf(f, " \"ov_ready_before_unblock\": %llu,\n", (unsigned long long) g.ov_ready_before_unblock);
++    fprintf(f, " \"ov_ready_outstanding\": %llu,\n", (unsigned long long) g.ov_ready_outstanding);
++    fprintf(f, " \"ov_dup_experts\": %llu,\n", (unsigned long long) g.ov_dup_experts);
++    fprintf(f, " \"ov_dup_ms\": %.3f,\n", g.ov_dup_ms);
++    fprintf(f, " \"ov_scratch_bytes\": %lld,\n", (long long) g.ov_scratch_bytes);
++    fprintf(f, " \"ov_verify_pass\": %llu,\n", (unsigned long long) g.ov_verify_pass);
++    fprintf(f, " \"ov_verify_fail\": %llu,\n", (unsigned long long) g.ov_verify_fail);
++    fprintf(f, " \"tl_resident_hist\": [");
++    for (int k = 0; k < 9; k++) {
++        fprintf(f, "%s%llu", k ? ", " : "", (unsigned long long) g.tl_resident_hist[k]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_resident\": [");
++    for (size_t i = 0; i < g.tl_event_resident.size(); i++) {
++        fprintf(f, "%s%d", i ? ", " : "", g.tl_event_resident[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_ready\": [");
++    for (size_t i = 0; i < g.tl_event_ready.size(); i++) {
++        fprintf(f, "%s%d", i ? ", " : "", g.tl_event_ready[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_loading\": [");
++    for (size_t i = 0; i < g.tl_event_loading.size(); i++) {
++        fprintf(f, "%s%d", i ? ", " : "", g.tl_event_loading[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_ordinary\": [");
++    for (size_t i = 0; i < g.tl_event_ordinary.size(); i++) {
++        fprintf(f, "%s%d", i ? ", " : "", g.tl_event_ordinary[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_expert_ms\": [");
++    for (size_t i = 0; i < g.tl_event_expert_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_expert_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_op_gate_ms\": [");
++    for (size_t i = 0; i < g.tl_event_op_gate_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_op_gate_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_op_up_ms\": [");
++    for (size_t i = 0; i < g.tl_event_op_up_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_op_up_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_op_down_ms\": [");
++    for (size_t i = 0; i < g.tl_event_op_down_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_op_down_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_io_ms\": [");
++    for (size_t i = 0; i < g.tl_event_io_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_io_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_step\": [");
++    for (size_t i = 0; i < g.tl_event_step.size(); i++) {
++        fprintf(f, "%s%llu", i ? ", " : "", (unsigned long long) g.tl_event_step[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_a0_ms\": [");
++    for (size_t i = 0; i < g.tl_event_a0_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_a0_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_attn_ms\": [");
++    for (size_t i = 0; i < g.tl_event_attn_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_attn_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_event_submit_ms\": [");
++    for (size_t i = 0; i < g.tl_event_submit_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_event_submit_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_shexp_n\": %llu,\n", (unsigned long long) g.tl_shexp_n);
++    fprintf(f, " \"tl_shexp_ms\": %.3f,\n", g.tl_shexp_ms);
++    fprintf(f, " \"tl_shexp_ev_ms\": [");
++    for (size_t i = 0; i < g.tl_shexp_ev_ms.size(); i++) {
++        fprintf(f, "%s%.4f", i ? ", " : "", g.tl_shexp_ev_ms[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_shexp_step\": [");
++    for (size_t i = 0; i < g.tl_shexp_step.size(); i++) {
++        fprintf(f, "%s%llu", i ? ", " : "", (unsigned long long) g.tl_shexp_step[i]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"tl_comp\": [");
++    {
++        std::lock_guard<std::mutex> lk(g.tl_comp_m);
++        for (size_t i = 0; i < g.tl_comp.size(); i++) {
++            const auto & c = g.tl_comp[i];
++            fprintf(f, "%s[%llu,%d,%d,%u,%.4f]", i ? ", " : "",
++                    (unsigned long long) c.event, c.slot, c.gid, (unsigned) c.kind, c.done_ms);
++        }
++    }
++    fprintf(f, "],\n");
++    {
++        const char * pn[3] = { "gate", "up", "down" };
++        for (int p = 0; p < 3; p++) {
++            fprintf(f, " \"tl_op_%s_ms\": %.3f,\n", pn[p], g.tl_op_ms[p]);
++            fprintf(f, " \"tl_op_%s_n\": %llu,\n", pn[p], (unsigned long long) g.tl_op_n[p]);
++            fprintf(f, " \"tl_op_%s_ms_per_call\": %.4f,\n", pn[p],
++                    g.tl_op_n[p] ? g.tl_op_ms[p] / (double) g.tl_op_n[p] : 0.0);
++        }
++        const char * kn[4] = { "packed", "gate", "up", "down" };
++        for (int k = 0; k < 4; k++) {
++            fprintf(f, " \"tl_read_%s_n\": %llu,\n", kn[k], (unsigned long long) g.tl_read_kind_n[k]);
++            fprintf(f, " \"tl_read_%s_ms_p50\": %.3f,\n", kn[k], hist_percentile(g.tl_read_kind_hist[k], 0.50));
++            fprintf(f, " \"tl_read_%s_ms_p95\": %.3f,\n", kn[k], hist_percentile(g.tl_read_kind_hist[k], 0.95));
++        }
++        auto vec_pct = [](std::vector<double> v, double q) -> double {
++            if (v.empty()) { return 0.0; }
++            std::sort(v.begin(), v.end());
++            return v[(size_t) (q * (double) (v.size() - 1))];
++        };
++        fprintf(f, " \"tl_bench\": {");
++        for (int p = 0; p < 3; p++) {
++            fprintf(f, "%s \"%s\": [", p ? "," : "", pn[p]);
++            for (int n = 1; n <= 8; n++) {
++                const std::vector<double> & bv = g.tl_bench_us[p][n];
++                fprintf(f, "%s{\"n\": %d, \"samples\": %llu, \"p50_us\": %.3f, \"p95_us\": %.3f}",
++                        n > 1 ? ", " : "", n, (unsigned long long) bv.size(),
++                        vec_pct(bv, 0.50), vec_pct(bv, 0.95));
++            }
++            fprintf(f, "]");
++        }
++        fprintf(f, " },\n");
++        fprintf(f, " \"tl_bench_done_gate\": %llu,\n", (unsigned long long) g.tl_bench_done[0]);
++        fprintf(f, " \"tl_bench_done_up\": %llu,\n", (unsigned long long) g.tl_bench_done[1]);
++        fprintf(f, " \"tl_bench_done_down\": %llu,\n", (unsigned long long) g.tl_bench_done[2]);
++        for (int p = 0; p < 3; p++) {
++            fprintf(f, " \"tl_conv_%s_ms\": %.4f,\n", pn[p], g.tl_conv_ms[p]);
++            fprintf(f, " \"tl_conv_%s_n\": %llu,\n", pn[p], (unsigned long long) g.tl_conv_n[p]);
++        }
++        fprintf(f, " \"tl_bench_full\": {");
++        for (int p = 0; p < 3; p++) {
++            fprintf(f, "%s \"%s\": [", p ? "," : "", pn[p]);
++            for (int n = 1; n <= 8; n++) {
++                const std::vector<double> & cv = g.tl_bench_conv_us[p][n];
++                const std::vector<double> & fv = g.tl_bench_full_us[p][n];
++                fprintf(f, "%s{\"n\": %d, \"samples\": %llu, \"conv_p50_us\": %.3f, \"full_p50_us\": %.3f}",
++                        n > 1 ? ", " : "", n, (unsigned long long) fv.size(),
++                        vec_pct(cv, 0.50), vec_pct(fv, 0.50));
++            }
++            fprintf(f, "]");
++        }
++        fprintf(f, " },\n");
++        fprintf(f, " \"tl_bench_act\": [");
++        for (int n = 1; n <= 8; n++) {
++            const std::vector<double> & av = g.tl_bench_act_us[n];
++            fprintf(f, "%s{\"n\": %d, \"samples\": %llu, \"p50_us\": %.3f, \"p95_us\": %.3f}",
++                    n > 1 ? ", " : "", n, (unsigned long long) av.size(),
++                    vec_pct(av, 0.50), vec_pct(av, 0.95));
++        }
++        fprintf(f, "],\n");
++        fprintf(f, " \"tl_bench_out\": [");
++        for (int n = 1; n <= 8; n++) {
++            const std::vector<double> & ov = g.tl_bench_out_us[n];
++            fprintf(f, "%s{\"n\": %d, \"samples\": %llu, \"p50_us\": %.3f, \"p95_us\": %.3f}",
++                    n > 1 ? ", " : "", n, (unsigned long long) ov.size(),
++                    vec_pct(ov, 0.50), vec_pct(ov, 0.95));
++        }
++        fprintf(f, "],\n");
++        fprintf(f, " \"tl_bench_first\": {");
++        for (int p = 0; p < 3; p++) {
++            fprintf(f, "%s \"%s\": [", p ? "," : "", pn[p]);
++            for (int n = 1; n <= 8; n++) {
++                const std::vector<double> & fv = g.tl_bench_first_us[p][n];
++                fprintf(f, "%s{\"n\": %d, \"samples\": %llu, \"p50_us\": %.3f, \"p95_us\": %.3f}",
++                        n > 1 ? ", " : "", n, (unsigned long long) fv.size(),
++                        vec_pct(fv, 0.50), vec_pct(fv, 0.95));
++            }
++            fprintf(f, "]");
++        }
++        fprintf(f, " },\n");
++    }
+     fprintf(f, " \"per_layer\": [\n");
+     for (size_t i = 0; i < g.layers.size(); i++) {
+         const auto & l = g.layers[i];
+@@ -1204,8 +1565,22 @@
+         }
+         submit_group & grp = groups.back();
+         grp.slots.push_back(s);
++        std::shared_ptr<tl_expert_rec> rec;
++        if (g.timeline) {
++            rec = std::make_shared<tl_expert_rec>();
++            if (g.tl_slot_rec.size() <= (size_t) l.il) {
++                g.tl_slot_rec.resize((size_t) l.il + 1);
++            }
++            if (g.tl_slot_rec[l.il].size() <= (size_t) s) {
++                g.tl_slot_rec[l.il].resize((size_t) l.n_slots);
++            }
++            g.tl_slot_rec[l.il][s] = rec;
++        }
+         for (auto & t : etasks) {
+             t.slot = s;
++            if (g.timeline) {
++                t.tl_rec = &rec->kind[t.kind];
++            }
+             grp.tasks.push_back(t);
+         }
+     }
+@@ -1349,6 +1724,95 @@
+ }
+ 
+ // Authoritative demand event under protected probation.
++// Execution 017 Part D: exact full contribution of the already-ready selected experts,
++// computed while the authoritative cold reads are in flight. Raw down outputs are stored
++// per selected position; the graph matmul hook skips these positions and the down hook
++// injects the stored columns so the canonical accumulation order is unchanged.
++void early_compute_ready(llama_moe_paging_layer & l, int k,
++                         const bool * is_demand, const int * hit_slot,
++                         const int * pf_slot, const bool * pf_was_loading) {
++    for (int i = 0; i < 8; i++) {
++        l.early_ready[i] = false;
++    }
++    l.early_n = 0;
++    if (!g.overlap_enabled || l.early_in == nullptr) {
++        return;
++    }
++    const ggml_tensor * in = l.early_in;
++    const ggml_tensor * wg = l.slot_gate;
++    const ggml_tensor * wu = l.slot_up;
++    const ggml_tensor * wd = l.slot_down;
++    if (wg == nullptr || wu == nullptr || wd == nullptr || in->type != GGML_TYPE_F32) {
++        return;
++    }
++    const int64_t ne_in = wg->ne[0];
++    const int64_t n_ff  = wg->ne[1];
++    const int64_t n_emb = wd->ne[1];
++    const ggml_type gt = wg->type, ut = wu->type, dt = wd->type;
++    const ggml_type gv = ggml_get_type_traits_cpu(gt)->vec_dot_type;
++    const ggml_type dv = ggml_get_type_traits_cpu(dt)->vec_dot_type;
++    const ggml_vec_dot_t vg = ggml_get_type_traits_cpu(gt)->vec_dot;
++    const ggml_vec_dot_t vu = ggml_get_type_traits_cpu(ut)->vec_dot;
++    const ggml_vec_dot_t vd = ggml_get_type_traits_cpu(dt)->vec_dot;
++    const size_t rs_g = ggml_row_size(gv, ne_in);
++    const size_t rs_d = ggml_row_size(dv, n_ff);
++    if (g.ov_fbuf.size() < (size_t) 3 * (size_t) n_ff) {
++        g.ov_fbuf.resize((size_t) 3 * (size_t) n_ff);
++    }
++    if (g.ov_inbuf.size() < rs_g) { g.ov_inbuf.resize(rs_g); }
++    if (g.ov_actbuf.size() < rs_d) { g.ov_actbuf.resize(rs_d); }
++    float * gate = g.ov_fbuf.data();
++    float * up   = gate + n_ff;
++    float * act  = up + n_ff;
++    const uint8_t * cin = nullptr;
++    if (in->type == gv) {
++        cin = (const uint8_t *) in->data;
++    } else {
++        ggml_get_type_traits_cpu(gv)->from_float((const float *) in->data, g.ov_inbuf.data(), ne_in);
++        cin = g.ov_inbuf.data();
++    }
++    if (l.early_out.size() < (size_t) k * (size_t) n_emb) {
++        l.early_out.resize((size_t) k * (size_t) n_emb);
++    }
++    for (int i = 0; i < k; i++) {
++        const bool ready = is_demand[i] || (pf_slot[i] >= 0 && !pf_was_loading[i]);
++        if (!ready) { continue; }
++        const int32_t slot = is_demand[i] ? hit_slot[i] : pf_slot[i];
++        if (slot < 0 || slot >= wg->ne[2]) { continue; }
++        const char * gw_slot = (const char *) wg->data + (size_t) slot * wg->nb[2];
++        const char * uw_slot = (const char *) wu->data + (size_t) slot * wu->nb[2];
++        const char * dw_slot = (const char *) wd->data + (size_t) slot * wd->nb[2];
++        for (int64_t r = 0; r < n_ff; r++) {
++            float tmp = 0.0f;
++            vg((int) ne_in, &tmp, 0, gw_slot + (size_t) r * wg->nb[1], 0, cin, 0, 1);
++            gate[r] = tmp;
++            tmp = 0.0f;
++            vu((int) ne_in, &tmp, 0, uw_slot + (size_t) r * wu->nb[1], 0, cin, 0, 1);
++            up[r] = tmp;
++        }
++        const double sw_t0 = now_ms();
++        ggml_vec_swiglu_f32((int) n_ff, act, gate, up);
++        g.ov_dup_ms += now_ms() - sw_t0;  // the graph activation recomputes this for ready columns
++        const uint8_t * cd = nullptr;
++        if (dt == dv) {
++            cd = (const uint8_t *) act;
++        } else {
++            ggml_get_type_traits_cpu(dv)->from_float(act, g.ov_actbuf.data(), n_ff);
++            cd = g.ov_actbuf.data();
++        }
++        float * d = l.early_out.data() + (size_t) i * (size_t) n_emb;
++        for (int64_t r = 0; r < n_emb; r++) {
++            float tmp = 0.0f;
++            vd((int) n_ff, &tmp, 0, dw_slot + (size_t) r * wd->nb[1], 0, cd, 0, 1);
++            d[r] = tmp;
++        }
++        l.early_ready[i] = true;
++        l.early_n++;
++    }
++    const int64_t sb = (int64_t) (l.early_out.size() * sizeof(float) + g.ov_fbuf.size() * sizeof(float) + g.ov_inbuf.size() + g.ov_actbuf.size());
++    if (sb > g.ov_scratch_bytes) { g.ov_scratch_bytes = sb; }
++}
++
+ void stage_event_prefetch(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
+     const double demand_t0 = now_ms();
+     // any completed speculative batch is READY before the router request is served
+@@ -1356,6 +1820,24 @@
+     if (l.a0_ready_ms > 0.0) {
+         g.a0_lead_us.push_back((demand_t0 - l.a0_ready_ms) * 1000.0);
+         l.a0_ready_ms = 0.0;
++    }
++    uint64_t tl_ev = 0;
++    if (g.timeline) {
++        l.tl_router_ms = demand_t0;
++        g.tl_layer_events++;
++        tl_ev = g.tl_event_seq++;
++        double a0dt = 0.0, attndt = 0.0;
++        if (l.tl_start_ms > 0.0 && l.tl_a0_ms > 0.0) {
++            a0dt = l.tl_a0_ms - l.tl_start_ms;
++            attndt = demand_t0 - l.tl_a0_ms;
++            g.tl_a0_ms += a0dt;
++            g.tl_a0_n++;
++            g.tl_attn_router_ms += attndt;
++            g.tl_attn_router_n++;
++        }
++        g.tl_event_step.push_back(g.tokens);
++        g.tl_event_a0_ms.push_back(a0dt);
++        g.tl_event_attn_ms.push_back(attndt);
+     }
+     const bool decay = g.policy == "event_decay90";
+     if (decay) {
+@@ -1386,6 +1868,30 @@
+             }
+         }
+     }
++    if (g.timeline) {
++        int n_res = 0, n_rdy = 0, n_ldg = 0, n_ord = 0;
++        for (int i = 0; i < k; i++) {
++            if (is_demand[i]) { n_res++; }
++            else if (pf_was_loading[i]) { n_ldg++; }
++            else if (pf_slot[i] >= 0) { n_rdy++; }
++            else { n_ord++; }
++        }
++        g.tl_resident_sel += (uint64_t) n_res;
++        g.tl_ready_sel += (uint64_t) n_rdy;
++        g.tl_loading_sel += (uint64_t) n_ldg;
++        g.tl_ordinary_sel += (uint64_t) n_ord;
++        g.tl_resident_hist[std::min(n_res, 8)]++;
++        g.tl_event_resident.push_back(n_res);
++        g.tl_event_ready.push_back(n_rdy);
++        g.tl_event_loading.push_back(n_ldg);
++        g.tl_event_ordinary.push_back(n_ord);
++        g.tl_requested_bytes += (uint64_t) k * (uint64_t) g.record_stride;
++        const uint64_t n_cold = (uint64_t) (k - n_res);
++        g.tl_miss_gate_bytes += n_cold * (uint64_t) l.gate_bytes;
++        g.tl_miss_up_bytes += n_cold * (uint64_t) l.up_bytes;
++        g.tl_miss_down_bytes += n_cold * (uint64_t) l.down_bytes;
++    }
++
+     // a0_shadow evidence: candidates the native router then requested
+     if (g.prefetch_mode == "a0_shadow" && l.pf_cand_n > 0) {
+         for (int j = 0; j < l.pf_cand_n; j++) {
+@@ -1440,8 +1946,16 @@
+         }
+         build_read_tasks(l, req[i], victim[i], tasks);
+     }
++    if (g.timeline) {
++        for (auto & t : tasks) {
++            t.event_id = tl_ev;
++        }
++    }
+ 
+     const double wait0 = now_ms();
++    if (g.timeline) {
++        l.tl_demand_submit_ms = wait0;
++    }
+     read_pending rp;
+     if (!tasks.empty()) {
+         submit_read_tasks(tasks, rp, /*high=*/true);
+@@ -1452,11 +1966,30 @@
+             promote_prefetch_tasks(l, req[i]);
+         }
+     }
++    // Execution 017 Part D: exact ready resident work while the cold reads are in flight
++    if (g.overlap_enabled) {
++        const double ov_t0 = now_ms();
++        early_compute_ready(l, k, is_demand, hit_slot, pf_slot, pf_was_loading);
++        g.ov_ms += now_ms() - ov_t0;
++        if (l.early_n > 0) {
++            g.ov_events++;
++            g.ov_experts += (uint64_t) l.early_n;
++            g.ov_ready_before_unblock += (uint64_t) l.early_n;
++            g.ov_dup_experts += (uint64_t) l.early_n;
++        }
++    }
+     for (int i = 0; i < k; i++) {
+         if (!pf_was_loading[i]) {
+             continue;
+         }
+         prefetch_join(l, pf_slot[i]);
++        if (g.timeline && (size_t) l.il < g.tl_slot_rec.size() &&
++                (size_t) pf_slot[i] < g.tl_slot_rec[l.il].size()) {
++            const std::shared_ptr<tl_expert_rec> & rec = g.tl_slot_rec[l.il][pf_slot[i]];
++            if (rec) {
++                record_expert_components(tl_ev, rec.get(), pf_slot[i], req[i]);
++            }
++        }
+         if (l.slot_state[pf_slot[i]] != ST_READY) {
+             // fail closed: a speculative read error that became authoritative
+             GGML_ABORT("moe paging prefetch: speculative read failed and became demand (layer %d expert %d)",
+@@ -1465,6 +1998,13 @@
+     }
+     const bool ord_ok = wait_read_tasks(rp);
+     const double wait_dt = now_ms() - wait0;
++    if (g.timeline) {
++        l.tl_demand_unblock_ms = now_ms();
++        g.tl_demand_io_ms += wait_dt;
++        g.tl_demand_io_n++;
++        g.tl_event_io_ms.push_back(wait_dt);
++        g.tl_event_submit_ms.push_back(wait0);
++    }
+     if (!tasks.empty() && !ord_ok) {
+         LLAMA_LOG_ERROR("%s: cannot read the full demand read set (layer %d, %d reads)\n",
+                         __func__, l.il, (int) tasks.size());
+@@ -2335,6 +2875,12 @@
+     g.nocache_requested = getenv_bool("LLAMA_MOE_PAGING_NOCACHE", false);
+     g.assert_checks = getenv_bool("LLAMA_MOE_PAGING_ASSERT", false);
+     g.timing = getenv_bool("LLAMA_MOE_PAGING_TIMING", true);
++    // Execution 017 measurement-only timeline and direct-cost bench.
++    g.timeline = getenv_bool("LLAMA_MOE_PAGING_TIMELINE", false);
++    g.direct_bench = std::max(0, std::min(512, getenv_int("LLAMA_MOE_PAGING_DIRECT_BENCH", 0)));
++    g.direct_bench_stride = std::max(1, getenv_int("LLAMA_MOE_PAGING_DIRECT_BENCH_STRIDE", 64));
++    g.overlap_enabled = getenv_bool("LLAMA_MOE_PAGING_OVERLAP", false);
++    g.overlap_verify = getenv_bool("LLAMA_MOE_PAGING_OVERLAP_VERIFY", false);
+     g.stats_path = getenv_str("LLAMA_MOE_PAGING_STATS", "results/moe_paging_stats.json");
+     g.stats_interval = getenv_int("LLAMA_MOE_PAGING_STATS_INTERVAL", 128);
+     g.fault_after = getenv_int("LLAMA_MOE_PAGING_FAULT_AFTER", 0);
+@@ -2345,7 +2891,9 @@
+     g.demand_slots = m;
+     g.prefetch_p = std::max(0, std::min(32, getenv_int("LLAMA_MOE_PAGING_PREFETCH_P", 0)));
+     g.prefetch_mode = getenv_str("LLAMA_MOE_PAGING_PREFETCH_MODE", "off");
+-    g.prefetch_shared = getenv_bool("LLAMA_MOE_PAGING_PREFETCH_SHARED", false);
++    // Execution 017: the normal A0 path keeps the shared speculative batch
++    // (Execution-015 semantics). Set the env var to 0 for the split diagnostic mode.
++    g.prefetch_shared = getenv_bool("LLAMA_MOE_PAGING_PREFETCH_SHARED", true);
+     const char * pf_seq_path = getenv("LLAMA_MOE_PAGING_PREFETCH_SEQ");
+     if (pf_seq_path != nullptr && pf_seq_path[0] != '\0') {
+         g.pf_seq_f = fopen(pf_seq_path, "w");
+@@ -2716,7 +3264,9 @@
+                                      int ith, int nth, void * userdata) {
+     if (ith == 0) {
+         auto * l = (llama_moe_paging_layer *) userdata;
+-        l->oracle_layer_start_ms = now_ms();
++        const double t = now_ms();
++        l->oracle_layer_start_ms = t;
++        l->tl_start_ms = t;
+     }
+     GGML_UNUSED(nth);
+     memcpy(dst->data, a->data, ggml_nbytes(a));
+@@ -2727,6 +3277,7 @@
+     if (ith == 0 && g.prefetch_enabled) {
+         auto * l = (llama_moe_paging_layer *) userdata;
+         l->a0_ready_ms = now_ms();
++        l->tl_a0_ms = l->a0_ready_ms;
+         if (l->oracle_layer_start_ms > 0.0) {
+             g.a0_compute_us.push_back((now_ms() - l->oracle_layer_start_ms) * 1000.0);
+         }
+@@ -2749,11 +3300,27 @@
+     if (ith == 0 && g.prefetch_enabled) {
+         auto * l = (llama_moe_paging_layer *) userdata;
+         l->oracle_layer_start_ms = now_ms();
++        l->tl_start_ms = l->oracle_layer_start_ms;
+         l->a0_ready_ms = now_ms();
++        l->tl_a0_ms = l->a0_ready_ms;
+         prefetch_oracle_event(*l);
+     }
+     GGML_UNUSED(nth);
+     memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++bool llama_moe_paging_overlap_enabled() {
++    return g.enabled && g.overlap_enabled;
++}
++
++void llama_moe_paging_early_input(ggml_tensor * dst, const ggml_tensor * a,
++                                  int ith, int nth, void * userdata) {
++    if (ith == 0) {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        if (g.overlap_enabled) { l->early_in = a; }
++    }
++    GGML_UNUSED(dst);
++    GGML_UNUSED(nth);
+ }
+ 
+ void llama_moe_paging_slots(ggml_tensor * dst, const ggml_tensor * a,
+@@ -2871,8 +3438,15 @@
+     // ggml indexes src1 as b[:, i % ne11, t]. This hook is single-token, so t = 0
+     // and only the ne11 rows of the token plane are read: gate/up have ne11 = 1
+     // (all experts share row 0), down has ne11 = K (request j uses row j).
++    const int proj = (src0 == l->slot_gate) ? 0 : (src0 == l->slot_up) ? 1 : 2;
++    if (g.timeline || g.direct_bench > 0) {
++        if (proj == 0) { l->tl_gate_out = dst; }
++        else if (proj == 1) { l->tl_up_out = dst; }
++        else { l->tl_down_out = dst; }
++    }
+     const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+     char * wbuf = nullptr;
++    const double conv_t0 = (g.timeline && ith == 0) ? now_ms() : 0.0;
+     if (src1->type != vec_dot_type) {
+         wbuf = (char *) params->wdata;
+         if (wbuf == nullptr) {
+@@ -2893,6 +3467,10 @@
+                        ne10);
+         }
+         ggml_barrier(params->threadpool);
++        if (g.timeline && ith == 0) {
++            g.tl_conv_ms[proj] += now_ms() - conv_t0;
++            g.tl_conv_n[proj]++;
++        }
+     }
+ 
+     if (ith == 0) {
+@@ -2908,29 +3486,194 @@
+     const int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+ 
+-    // one selected matrix per ascending resident slot
+-    for (int jj = 0; jj < n_ids; jj++) {
+-        const int j = order[jj];
+-        const int32_t s = sel[j];
+-        const char * src0_cur = (const char *) src0->data + (size_t) s * nb02;
+-        const int64_t i11 = (int64_t) j % ne11;
+-        GGML_ASSERT(i11 >= 0 && i11 < ne11);
+-        const char * src1_row = (src1->type == vec_dot_type)
+-            ? (const char *) src1->data + (size_t) i11 * nb11
+-            : wbuf + (size_t) i11 * nbw1;
+-        float * dst_col = (float *) ((char *) dst->data + (size_t) j * nb1);
+-
+-        (void) chunk_size;
+-        for (int64_t ic = ith; ic < nchunk0; ic += nth) {
+-            const int64_t ir0_start = dr0 * ic;
+-            const int64_t ir0_end = std::min(ir0_start + dr0, nr0);
+-            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ir0++) {
+-                float tmp = 0.0f;
+-                ggml_vec_dot_t vec_dot = ggml_get_type_traits_cpu(type)->vec_dot;
+-                vec_dot(ne00, &tmp, 0, src0_cur + ir0 * nb01, 0, src1_row, 0, 1);
+-                dst_col[ir0] = tmp;
+-            }
+-        }
++    // Execution 017: keep the exact kernel loop in a lambda so the same path can
++    // be timed and replayed for n = 1..n_ids selected experts.
++    auto run_selected = [&](int n_sel) {
++        for (int jj = 0; jj < n_sel; jj++) {
++            const int j = order[jj];
++            if (g.ov_skip && l->early_ready[j]) { continue; }
++            const int32_t s = sel[j];
++            const char * src0_cur = (const char *) src0->data + (size_t) s * nb02;
++            const int64_t i11 = (int64_t) j % ne11;
++            GGML_ASSERT(i11 >= 0 && i11 < ne11);
++            const char * src1_row = (src1->type == vec_dot_type)
++                ? (const char *) src1->data + (size_t) i11 * nb11
++                : wbuf + (size_t) i11 * nbw1;
++            float * dst_col = (float *) ((char *) dst->data + (size_t) j * nb1);
++
++            (void) chunk_size;
++            for (int64_t ic = ith; ic < nchunk0; ic += nth) {
++                const int64_t ir0_start = dr0 * ic;
++                const int64_t ir0_end = std::min(ir0_start + dr0, nr0);
++                for (int64_t ir0 = ir0_start; ir0 < ir0_end; ir0++) {
++                    float tmp = 0.0f;
++                    ggml_vec_dot_t vec_dot = ggml_get_type_traits_cpu(type)->vec_dot;
++                    vec_dot(ne00, &tmp, 0, src0_cur + ir0 * nb01, 0, src1_row, 0, 1);
++                    dst_col[ir0] = tmp;
++                }
++            }
++        }
++    };
++
++    // correction 5: first-touch matmul for exactly one cycled n, measured before the
++    // production run_selected(n_ids) touches the selected weight rows.
++    if (g.direct_bench > 0) {
++        if (ith == 0) {
++            g.tl_ft_now = 0;
++            const uint64_t seen = g.tl_op_n[proj];
++            const bool due = (seen % (uint64_t) g.direct_bench_stride) == 0;
++            if (due) {
++                const int cand = 1 + (int) ((seen / (uint64_t) g.direct_bench_stride) % (uint64_t) n_ids);
++                if (cand >= 1 && cand <= n_ids && g.tl_ft_done[proj][cand] < (uint64_t) g.direct_bench) {
++                    g.tl_ft_now = proj + 1;
++                    g.tl_ft_n = cand;
++                    g.tl_ft_done[proj][cand]++;
++                }
++            }
++        }
++        ggml_barrier(params->threadpool);
++        const int ft_proj = g.tl_ft_now;
++        const int ft_n = g.tl_ft_n;
++        if (ft_proj > 0 && ft_n >= 1 && ft_n <= n_ids) {
++            const double ft0 = (ith == 0) ? now_ms() : 0.0;
++            run_selected(ft_n);
++            ggml_barrier(params->threadpool);
++            if (ith == 0) {
++                g.tl_bench_first_us[proj][ft_n].push_back((now_ms() - ft0) * 1000.0);
++            }
++            ggml_barrier(params->threadpool);
++        }
++    }
++
++    const double op_t0 = (g.timeline && ith == 0) ? now_ms() : 0.0;
++
++    g.ov_skip = g.overlap_enabled && !g.overlap_verify;
++    run_selected(n_ids);
++    g.ov_skip = false;
++
++    if (g.timeline) {
++        ggml_barrier(params->threadpool);
++        if (ith == 0) {
++            const double opdt = now_ms() - op_t0;
++            g.tl_op_ms[proj] += opdt;
++            g.tl_op_n[proj]++;
++            if (proj == 0) { g.tl_event_op_gate_ms.push_back(opdt); }
++            else if (proj == 1) { g.tl_event_op_up_ms.push_back(opdt); }
++            else { g.tl_event_op_down_ms.push_back(opdt); }
++        }
++    }
++
++    // Execution 017: exact cost of n = 1..n_ids selected experts on the real
++    // resident weights. Bounded by LLAMA_MOE_PAGING_DIRECT_BENCH samples/projection.
++    if (g.direct_bench > 0) {
++        if (ith == 0) {
++            const uint64_t seen = g.tl_op_n[proj];
++            const bool due = (seen % (uint64_t) g.direct_bench_stride) == 0;
++            g.tl_bench_now = (due && g.tl_bench_done[proj] < (uint64_t) g.direct_bench) ? proj + 1 : 0;
++            if (g.tl_bench_now > 0) {
++                g.tl_bench_done[proj]++;
++            }
++        }
++        ggml_barrier(params->threadpool);
++        const int bench_proj = g.tl_bench_now;
++        if (bench_proj > 0) {
++            for (int n = 1; n <= n_ids; n++) {
++                ggml_barrier(params->threadpool);
++                const double c0 = (ith == 0) ? now_ms() : 0.0;
++                if (src1->type != vec_dot_type) {
++                    const int64_t n_conv = std::min<int64_t>(n, ne11);
++                    for (int64_t i11c = ith; i11c < n_conv; i11c += nth) {
++                        from_float((const float *) ((const char *) src1->data + (size_t) i11c * nb11),
++                                   wbuf + (size_t) i11c * nbw1,
++                                   ne10);
++                    }
++                }
++                ggml_barrier(params->threadpool);
++                const double b0 = (ith == 0) ? now_ms() : 0.0;
++                run_selected(n);
++                ggml_barrier(params->threadpool);
++                if (ith == 0) {
++                    const double bend = now_ms();
++                    g.tl_bench_conv_us[bench_proj - 1][n].push_back((b0 - c0) * 1000.0);
++                    g.tl_bench_us[bench_proj - 1][n].push_back((bend - b0) * 1000.0);
++                    g.tl_bench_full_us[bench_proj - 1][n].push_back((bend - c0) * 1000.0);
++                }
++            }
++            // restore the full production result (the kernel is deterministic)
++            ggml_barrier(params->threadpool);
++            run_selected(n_ids);
++            ggml_barrier(params->threadpool);
++            // correction 4: directly measured activation and routed-output weighting
++            if (bench_proj == 3 && l->tl_gate_out != nullptr && l->tl_up_out != nullptr &&
++                    l->tl_down_out != nullptr) {
++                const int n_ff  = (int) l->tl_gate_out->ne[0];
++                const int n_emb = (int) l->tl_down_out->ne[0];
++                const size_t need = (size_t) 8 * ((size_t) n_ff + (size_t) n_emb) + 16;
++                if (g.tl_bench_scratch.size() < need) {
++                    g.tl_bench_scratch.resize(need);
++                }
++                float * sact = g.tl_bench_scratch.data();
++                float * sout = sact + 8 * (size_t) n_ff;
++                for (int n = 1; n <= n_ids; n++) {
++                    ggml_barrier(params->threadpool);
++                    const double a0 = (ith == 0) ? now_ms() : 0.0;
++                    for (int j = ith; j < n; j += nth) {
++                        const float * gcol = (const float *) ((const char *) l->tl_gate_out->data + (size_t) j * l->tl_gate_out->nb[1]);
++                        const float * ucol = (const float *) ((const char *) l->tl_up_out->data   + (size_t) j * l->tl_up_out->nb[1]);
++                        ggml_vec_swiglu_f32(n_ff, sact + (size_t) j * n_ff, gcol, ucol);
++                    }
++                    ggml_barrier(params->threadpool);
++                    if (ith == 0) {
++                        g.tl_bench_act_us[n].push_back((now_ms() - a0) * 1000.0);
++                    }
++                    ggml_barrier(params->threadpool);
++                    const double o0 = (ith == 0) ? now_ms() : 0.0;
++                    for (int j = ith; j < n; j += nth) {
++                        const float * dcol = (const float *) ((const char *) l->tl_down_out->data + (size_t) j * l->tl_down_out->nb[1]);
++                        float * ocol = sout + (size_t) j * n_emb;
++                        for (int i = 0; i < n_emb; i++) {
++                            ocol[i] = dcol[i] * g.tl_bench_scale;
++                        }
++                    }
++                    ggml_barrier(params->threadpool);
++                    if (ith == 0) {
++                        g.tl_bench_out_us[n].push_back((now_ms() - o0) * 1000.0);
++                    }
++                }
++            }
++            if (ith == 0) {
++                g.tl_bench_now = 0;
++            }
++        }
++    }
++
++    // Execution 017 Part D: inject the early-computed ready experts; in verify mode
++    // diff them byte-for-byte against the canonical direct_sparse down result.
++    if (g.overlap_enabled && proj == 2) {
++        ggml_barrier(params->threadpool);
++        if (ith == 0) {
++            const int n_emb = (int) l->slot_down->ne[1];
++            for (int j = 0; j < n_ids; j++) {
++                if (!l->early_ready[j]) { continue; }
++                float * dcol = (float *) ((char *) dst->data + (size_t) j * nb1);
++                const float * e = l->early_out.data() + (size_t) j * (size_t) n_emb;
++                if (g.overlap_verify) {
++                    int mism = 0;
++                    for (int r = 0; r < n_emb; r++) {
++                        if (memcmp(&dcol[r], &e[r], sizeof(float)) != 0) { mism++; }
++                    }
++                    if (mism > 0) {
++                        g.ov_verify_fail++;
++                        fprintf(stderr, "MOE_OVERLAP_VERIFY layer=%d j=%d slot=%d mismatches=%d\n",
++                                l->il, j, sel[order[j]], mism);
++                    } else {
++                        g.ov_verify_pass++;
++                    }
++                }
++                memcpy(dcol, e, (size_t) n_emb * sizeof(float));
++            }
++        }
++        ggml_barrier(params->threadpool);
+     }
+ 
+     // Execution 012 debug: run the ordinary CPU implementation on the same op and
+@@ -3050,7 +3793,48 @@
+     GGML_UNUSED(dst);
+     GGML_UNUSED(a);
+     auto * l = (llama_moe_paging_layer *) userdata;
+-    l->compute_ms += now_ms() - l->compute_start_ms;
++    const double t = now_ms();
++    l->compute_ms += t - l->compute_start_ms;
++    if (g.timeline && l->tl_demand_unblock_ms > 0.0) {
++        g.tl_expert_ms += t - l->tl_demand_unblock_ms;
++        g.tl_expert_n++;
++        g.tl_event_expert_ms.push_back(t - l->tl_demand_unblock_ms);
++    }
++}
++
++bool llama_moe_paging_shexp_timing() {
++    return g.enabled && g.timeline && g.prefetch_enabled;
++}
++
++void llama_moe_paging_shexp_start(ggml_tensor * dst, const ggml_tensor * a,
++                                  int ith, int nth, void * userdata) {
++    if (ith == 0) {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        l->tl_shexp_start_ms = now_ms();
++    }
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++void llama_moe_paging_shexp_end(ggml_tensor * dst, const ggml_tensor * a,
++                                int ith, int nth, void * userdata) {
++    if (ith == 0) {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        const double t = now_ms();
++        if (l->tl_shexp_start_ms > 0.0) {
++            const double dt = t - l->tl_shexp_start_ms;
++            // The slots op increments g.tokens at the last layer before this
++            // marker runs, so undo that one-step skew.
++            const uint64_t step = (l->il == g.n_layer - 1 && g.tokens > 0) ? g.tokens - 1 : g.tokens;
++            g.tl_shexp_ms += dt;
++            g.tl_shexp_n++;
++            g.tl_shexp_step.push_back(step);
++            g.tl_shexp_ev_ms.push_back(dt);
++            l->tl_shexp_start_ms = 0.0;
++        }
++    }
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
+ }
+ 
+ // C-linkage entry registered with ggml-cpu (see ggml_cpu_set_moe_mul_mat_id_hook).
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -604,6 +604,13 @@
+ 
+     // Add shared experts if present - following Qwen3Next reference implementation
+     if (model.layers[il].ffn_up_shexp != nullptr) {
++        llama_moe_paging_layer * shexp_page = nullptr;
++        if (llama_moe_paging_shexp_timing()) {
++            shexp_page = llama_moe_paging_layer_for(il);
++            if (shexp_page != nullptr) {
++                cur = ggml_map_custom1(ctx0, cur, llama_moe_paging_shexp_start, 1, shexp_page);
++            }
++        }
+         ggml_tensor * ffn_shexp =
+             build_ffn(cur,
+                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+@@ -627,6 +634,10 @@
+         // Apply the gate to the shared expert output
+         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+         cb(ffn_shexp, "ffn_shexp_gated", il);
++
++        if (shexp_page != nullptr) {
++            ffn_shexp = ggml_map_custom1(ctx0, ffn_shexp, llama_moe_paging_shexp_end, 1, shexp_page);
++        }
+ 
+         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+         cb(cur, "ffn_out", il);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2154,6 +2154,11 @@
+     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+     cb(weights, "ffn_moe_weights", il);
+ 
++    if (moe_page != nullptr && llama_moe_paging_overlap_enabled()) {
++        // Execution 017 Part D: cache the MoE input for the early ready-expert compute
++        cur = ggml_map_custom1_inplace(ctx0, cur, llama_moe_paging_early_input, 1, moe_page);
++    }
++
+     if (moe_page != nullptr) {
+         if (llama_moe_paging_direct_mode()) {
+             // page the selected experts into resident slots and remap ids to slots

@@ -1,0 +1,131 @@
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -935,6 +935,11 @@
+     fprintf(f, " \"predictor_lead_us_p50\": %.3f,\n", a0l_pct(0.50));
+     fprintf(f, " \"predictor_lead_us_p95\": %.3f,\n", a0l_pct(0.95));
+     fprintf(f, " \"prefetch_occupancy_mean\": %.3f,\n", mean_occupancy);
++    size_t policy_bytes = 0;
++    for (const auto & l : g.layers) {
++        policy_bytes += (l.demand_frequency.capacity() + l.demand_last_event.capacity() + l.shadow_frequency.capacity() + l.shadow_last_event.capacity()) * sizeof(uint64_t);
++    }
++    fprintf(f, " \"policy_metadata_bytes\": %zu,\n", policy_bytes);
+     fprintf(f, " \"shadow_checks\": %llu,\n", (unsigned long long) g.shadow_checks);
+     fprintf(f, " \"shadow_fail\": %llu,\n", (unsigned long long) g.shadow_fail);
+     fprintf(f, " \"hot_fill_semantics\": \"%s\",\n",
+@@ -1440,6 +1445,24 @@
+     return -1;
+ }
+ 
++// Smaller frequency / (age + 1) loses. Compare exact integer ratios.
++bool frequency_age_less(const std::vector<uint64_t> & frequency, const std::vector<uint64_t> & last,
++                        uint64_t event, int a, int b, uint64_t recency_a, uint64_t recency_b) {
++    GGML_ASSERT(a >= 0 && b >= 0 && event >= last[a] && event >= last[b]);
++    const unsigned __int128 left = (unsigned __int128) frequency[a] * (event - last[b] + 1);
++    const unsigned __int128 right = (unsigned __int128) frequency[b] * (event - last[a] + 1);
++    return left == right ? recency_a < recency_b : left < right;
++}
++
++void observe_demand_history(std::vector<uint64_t> & frequency, std::vector<uint64_t> & last,
++                            uint64_t event, const int32_t * req, int k) {
++    for (int i = 0; i < k; ++i) {
++        GGML_ASSERT(req[i] >= 0 && (size_t) req[i] < frequency.size() && frequency[req[i]] < UINT64_MAX);
++        ++frequency[req[i]];
++        last[req[i]] = event;
++    }
++}
++
+ // Demand-only LRU victim among DEMAND slots not reserved by this event.
+ int pick_demand_victim(const llama_moe_paging_layer & l, const uint8_t * reserved) {
+     int slot = -1;
+@@ -1452,7 +1475,9 @@
+             slot = s;
+             continue;
+         }
+-        const bool better = decay ? (l.score[s] < l.score[slot]) : (l.last_use[s] < l.last_use[slot]);
++        const bool better = g.policy == "frequency_age" ?
++            frequency_age_less(l.demand_frequency, l.demand_last_event, l.events + 1,
++                               l.slot_expert[s], l.slot_expert[slot], l.last_use[s], l.last_use[slot]) : decay ? (l.score[s] < l.score[slot]) : (l.last_use[s] < l.last_use[slot]);
+         if (better) {
+             slot = s;
+         }
+@@ -1702,6 +1727,9 @@
+ // physical DEMAND set stayed identical to demand-only.
+ int shadow_step(llama_moe_paging_layer & l, const int32_t * req, int k, bool * is_miss) {
+     const int M = g.demand_slots;
++    if (g.policy == "frequency_age") {
++        observe_demand_history(l.shadow_frequency, l.shadow_last_event, l.events + 1, req, k);
++    }
+     std::vector<uint8_t> reserved((size_t) M, 0);
+     int n_miss = 0;
+     for (int i = 0; i < k; i++) {
+@@ -1745,7 +1773,10 @@
+                 if (reserved[j]) {
+                     continue;
+                 }
+-                if (victim < 0 || l.shadow_last_use[j] < l.shadow_last_use[victim]) {
++                if (victim < 0 || (g.policy == "frequency_age" ?
++                    frequency_age_less(l.shadow_frequency, l.shadow_last_event, l.events + 1,
++                                       l.shadow_expert[j], l.shadow_expert[victim], l.shadow_last_use[j], l.shadow_last_use[victim]) :
++                    l.shadow_last_use[j] < l.shadow_last_use[victim])) {
+                     victim = j;
+                 }
+             }
+@@ -1935,6 +1966,10 @@
+         }
+     }
+ 
++    if (g.policy == "frequency_age") {
++        observe_demand_history(l.demand_frequency, l.demand_last_event, l.events + 1, req, k);
++    }
++
+     int  hit_slot[MAX_K];
+     int  pf_slot[MAX_K];
+     bool is_demand[MAX_K];
+@@ -3022,9 +3057,9 @@
+     g.shadow_assert = g.assert_checks || getenv_bool("LLAMA_MOE_PAGING_SHADOW", false);
+     if (g.prefetch_p > 0 && g.prefetch_mode != "off") {
+         const bool usable = g.compute_mode == "direct_sparse" && g.backend == "gguf3" &&
+-                            g.policy == "lru" && !g.hot && g.qd > 1;
++                            (g.policy == "lru" || g.policy == "frequency_age") && !g.hot && g.qd > 1;
+         if (!usable) {
+-            LLAMA_LOG_WARN("%s: prefetch disabled (needs direct_sparse+gguf3+lru+qd>1+hot=0)\n", __func__);
++            LLAMA_LOG_WARN("%s: prefetch disabled (needs direct_sparse+gguf3+lru/frequency_age+qd>1+hot=0)\n", __func__);
+             g.prefetch_p = 0;
+             g.prefetch_mode = "off";
+         } else {
+@@ -3032,6 +3067,10 @@
+             g.m_slots = m + g.prefetch_p;
+             g.prefetch_pool = std::max(g.prefetch_p, g.prefetch_pool);
+         }
++    }
++
++    if (g.policy == "frequency_age" && (!g.prefetch_enabled || g.prefetch_mode != "a0")) {
++        GGML_ABORT("frequency_age requires direct_sparse/gguf3/A0/P>0/QD>1/hot=0");
+     }
+ 
+     const std::string store = getenv_str("LLAMA_MOE_PAGING_STORE", "cold-experts.bin");
+@@ -3194,6 +3233,12 @@
+         l.demand_count = 0;
+         l.shadow_expert.assign((size_t) g.demand_slots, -1);
+         l.shadow_last_use.assign((size_t) g.demand_slots, 0);
++        if (g.policy == "frequency_age") {
++            l.demand_frequency.assign(g.n_expert, 0);
++            l.demand_last_event.assign(g.n_expert, 0);
++            l.shadow_frequency.assign(g.n_expert, 0);
++            l.shadow_last_event.assign(g.n_expert, 0);
++        }
+         l.shadow_n = 0;
+         l.pf_cand_n = 0;
+         l.stage_expert.assign(g.k_slots, -1);
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -58,6 +58,9 @@
+     std::vector<int32_t>  slot_expert;  // global expert id per slot, -1 == empty
+     std::vector<uint64_t> last_use;     // per-slot recency clock
+     std::vector<double>   score;        // event-decay90 score
++    // Execution 019: authoritative demand history, including evicted experts.
++    std::vector<uint64_t> demand_frequency, demand_last_event;
++    std::vector<uint64_t> shadow_frequency, shadow_last_event;
+     std::vector<uint8_t>  reserved;     // per event: slot is a miss destination
+ 
+     // component geometry inside a record

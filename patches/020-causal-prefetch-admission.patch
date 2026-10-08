@@ -1,0 +1,165 @@
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -219,6 +219,11 @@
+     int          demand_slots = 0;        // logical M
+     std::string  prefetch_mode = "off";   // off | a0 | a0_shadow | oracle
+     bool         shadow_assert = false;
++    std::string pf_admission = "all";
++    FILE * pf_decisions_f = nullptr;
++    uint64_t pf_gate_considered = 0, pf_gate_rejected = 0;
++    uint64_t pf_gate_rejected_useful = 0, pf_gate_rejected_wasted = 0;
++    double pf_gate_cpu_ms = 0.0;
+     uint64_t pf_candidates = 0;
+     uint64_t pf_submitted_experts = 0;
+     uint64_t pf_submitted_bytes = 0;
+@@ -889,6 +894,13 @@
+     fprintf(f, " \"demand_slots\": %d,\n", g.demand_slots);
+     fprintf(f, " \"probation_slots\": %d,\n", g.prefetch_enabled ? g.prefetch_p : 0);
+     fprintf(f, " \"physical_slots\": %d,\n", g.m_slots);
++    fprintf(f, " \"prefetch_admission\": \"%s\",\n", g.pf_admission.c_str());
++    fprintf(f, " \"prefetch_admission_metadata_bytes\": %zu,\n", g.layers.size() * (sizeof(g.layers[0].pf_rank_observations) + sizeof(g.layers[0].pf_rank_useful) + sizeof(g.layers[0].pf_nominations)));
++    fprintf(f, " \"prefetch_gate_considered\": %llu,\n", (unsigned long long) g.pf_gate_considered);
++    fprintf(f, " \"prefetch_gate_rejected\": %llu,\n", (unsigned long long) g.pf_gate_rejected);
++    fprintf(f, " \"prefetch_gate_rejected_useful\": %llu,\n", (unsigned long long) g.pf_gate_rejected_useful);
++    fprintf(f, " \"prefetch_gate_rejected_wasted\": %llu,\n", (unsigned long long) g.pf_gate_rejected_wasted);
++    fprintf(f, " \"prefetch_gate_cpu_ms\": %.6f,\n", g.pf_gate_cpu_ms);
+     fprintf(f, " \"prefetch_candidates\": %llu,\n", (unsigned long long) g.pf_candidates);
+     fprintf(f, " \"prefetch_submitted_experts\": %llu,\n", (unsigned long long) g.pf_submitted_experts);
+     fprintf(f, " \"prefetch_submitted_bytes\": %llu,\n", (unsigned long long) g.pf_submitted_bytes);
+@@ -1266,6 +1278,7 @@
+     pool_stop();
+     if (g.ov_event_file) { fclose(g.ov_event_file); g.ov_event_file = nullptr; }
+     oracle_capture_close();
++    if (g.pf_decisions_f) { fclose(g.pf_decisions_f); g.pf_decisions_f = nullptr; }
+     if (g.pf_seq_f != nullptr) {
+         fclose(g.pf_seq_f);
+         g.pf_seq_f = nullptr;
+@@ -1575,26 +1588,51 @@
+     }
+ }
+ 
+-// Choose up to P nonresident, non-existing experts from the sorted A0 pool.
++// Use only observations from completed authoritative events. No backfill.
++bool prefetch_rank_admit(uint64_t observations, uint64_t useful) {
++    GGML_ASSERT(useful <= observations);
++    return observations < 16 || (unsigned __int128) 4 * useful >= (unsigned __int128) 3 * observations;
++}
++
+ int prefetch_select(llama_moe_paging_layer & l, const int32_t * pool, int npool, int32_t * out) {
++    const double cpu0 = thread_cpu_ms();
++    GGML_ASSERT(l.pf_nomination_n == 0);
+     int n = 0;
+-    for (int i = 0; i < npool && n < g.prefetch_p; i++) {
++    for (int i = 0; i < npool && l.pf_nomination_n < g.prefetch_p; i++) {
+         const int32_t e = pool[i];
+         g.pf_candidates++;
+-        if (e < 0 || e >= g.n_expert) {
+-            continue;
+-        }
+-        if (find_slot_state(l, e, ST_DEMAND) >= 0) {
+-            g.pf_skipped_demand++;
+-            continue;
+-        }
+-        if (find_slot_state(l, e, ST_READY) >= 0 || find_slot_state(l, e, ST_LOADING) >= 0) {
+-            g.pf_skipped_existing++;
+-            continue;
+-        }
+-        out[n++] = e;
++        if (e < 0 || e >= g.n_expert) { continue; }
++        if (find_slot_state(l, e, ST_DEMAND) >= 0) { g.pf_skipped_demand++; continue; }
++        if (find_slot_state(l, e, ST_READY) >= 0 || find_slot_state(l, e, ST_LOADING) >= 0) { g.pf_skipped_existing++; continue; }
++        const int bin = std::min(i / 4, 3);
++        auto & nomination = l.pf_nominations[l.pf_nomination_n++];
++        nomination = {e, i + 1, false, false, l.pf_rank_observations[bin], l.pf_rank_useful[bin]};
++        nomination.admitted = g.pf_admission == "all" || prefetch_rank_admit(nomination.observations, nomination.useful);
++        g.pf_gate_considered++;
++        if (nomination.admitted) { out[n++] = e; } else { g.pf_gate_rejected++; }
+     }
++    g.pf_gate_cpu_ms += thread_cpu_ms() - cpu0;
+     return n;
++}
++
++void prefetch_observe_nominations(llama_moe_paging_layer & l, const int32_t * req, int k) {
++    const double cpu0 = thread_cpu_ms();
++    for (int i = 0; i < l.pf_nomination_n; ++i) {
++        const auto & nomination = l.pf_nominations[i];
++        bool wanted = false;
++        for (int j = 0; j < k; ++j) { wanted |= req[j] == nomination.expert; }
++        const int bin = std::min((nomination.rank - 1) / 4, 3);
++        if (l.pf_rank_observations[bin] == UINT64_MAX) { GGML_ABORT("prefetch observation overflow"); }
++        ++l.pf_rank_observations[bin];
++        l.pf_rank_useful[bin] += wanted;
++        if (!nomination.admitted) { if (wanted) { ++g.pf_gate_rejected_useful; } else { ++g.pf_gate_rejected_wasted; } }
++        if (g.pf_decisions_f) {
++            fprintf(g.pf_decisions_f, "%llu,%d,%d,%d,%d,%d,%d,%llu,%llu\n", (unsigned long long) g.tokens, l.il, nomination.expert, nomination.rank,
++                    nomination.admitted, nomination.submitted, wanted, (unsigned long long) nomination.observations, (unsigned long long) nomination.useful);
++        }
++    }
++    l.pf_nomination_n = 0;
++    g.pf_gate_cpu_ms += thread_cpu_ms() - cpu0;
+ }
+ 
+ // Execution 016 C1: FNV-1a over one submitted (token_event, layer, expert_id).
+@@ -1633,6 +1671,9 @@
+             g.pf_skipped_busy++;
+             continue;
+         }
++        for (int j = 0; j < l.pf_nomination_n; ++j) {
++            if (l.pf_nominations[j].expert == cand[i]) { l.pf_nominations[j].submitted = true; }
++        }
+         l.slot_expert[s] = cand[i];
+         l.slot_state[s] = ST_LOADING;
+         l.pf_submit_ms[s] = now_ms();
+@@ -1959,6 +2000,7 @@
+         g.tl_event_a0_ms.push_back(a0dt);
+         g.tl_event_attn_ms.push_back(attndt);
+     }
++    prefetch_observe_nominations(l, req, k);
+     const bool decay = g.policy == "event_decay90";
+     if (decay) {
+         for (int s = 0; s < l.n_slots; s++) {
+@@ -3073,6 +3115,18 @@
+         GGML_ABORT("frequency_age requires direct_sparse/gguf3/A0/P>0/QD>1/hot=0");
+     }
+ 
++    g.pf_admission = getenv_str("LLAMA_MOE_PAGING_PREFETCH_ADMISSION", "all");
++    if (g.pf_admission != "all" && g.pf_admission != "rank_gate") { GGML_ABORT("invalid prefetch admission"); }
++    if (g.pf_admission == "rank_gate" && (!g.prefetch_enabled || g.prefetch_mode != "a0" || g.prefetch_p != 2 || g.prefetch_pool != 16)) {
++        GGML_ABORT("rank_gate requires A0/P2/K16");
++    }
++    const char * decision_path = getenv("LLAMA_MOE_PAGING_PREFETCH_DECISIONS");
++    if (decision_path && *decision_path) {
++        GGML_ASSERT(g.prefetch_enabled && g.prefetch_mode == "a0");
++        g.pf_decisions_f = fopen(decision_path, "w"); GGML_ASSERT(g.pf_decisions_f);
++        fprintf(g.pf_decisions_f, "step,layer,expert,rank,admit,submitted,wanted,observations,useful\n");
++    }
++
+     const std::string store = getenv_str("LLAMA_MOE_PAGING_STORE", "cold-experts.bin");
+     if (g.backend != "gguf3") {
+         g.store_fd = open(store.c_str(), O_RDONLY);
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -31,6 +31,12 @@
+ struct ggml_tensor;
+ struct ggml_compute_params;
+ typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
++
++struct moe_prefetch_nomination {
++    int32_t expert = -1, rank = 0;
++    bool admitted = false, submitted = false;
++    uint64_t observations = 0, useful = 0;
++};
+ 
+ struct llama_moe_paging_layer {
+     int il = -1;
+@@ -147,6 +153,10 @@
+     // a0_shadow: the candidate set chosen at the layer-start A0 event
+     int32_t               pf_cand[32] = {};
+     int                   pf_cand_n = 0;
++    // Execution 020: observe nominations even when admission rejects them.
++    uint64_t pf_rank_observations[4] = {}, pf_rank_useful[4] = {};
++    moe_prefetch_nomination pf_nominations[32];
++    int pf_nomination_n = 0;
+     // predictor placement lead: A0-ready -> authoritative demand
+     double                a0_ready_ms = 0.0;
+ 

@@ -1,0 +1,220 @@
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -224,6 +224,10 @@
+     uint64_t pf_gate_considered = 0, pf_gate_rejected = 0;
+     uint64_t pf_gate_rejected_useful = 0, pf_gate_rejected_wasted = 0;
+     double pf_gate_cpu_ms = 0.0;
++    // Worker-written cost model is protected by hist_m; active bytes by mtx.
++    double pf_read_ms_per_byte = 0.0;
++    uint64_t pf_read_samples = 0, pf_active_bytes = 0;
++    double pf_rejected_useful_lead_proxy_ms = 0.0, pf_admitted_useful_lead_proxy_ms = 0.0;
+     uint64_t pf_candidates = 0;
+     uint64_t pf_submitted_experts = 0;
+     uint64_t pf_submitted_bytes = 0;
+@@ -533,6 +537,13 @@
+     {
+         std::lock_guard<std::mutex> lk(g.hist_m);
+         hist_add(g.hist, dt);
++        if (g.pf_admission == "time_gate" && ok && t.size > 0 && std::isfinite(dt) && dt > 0.0) {
++            const double sample = dt / (double) t.size;
++            g.pf_read_ms_per_byte = g.pf_read_samples == 0 ? sample :
++                                   0.875 * g.pf_read_ms_per_byte + 0.125 * sample;
++            if (g.pf_read_samples == UINT64_MAX) { GGML_ABORT("prefetch read sample overflow"); }
++            ++g.pf_read_samples;
++        }
+         if (g.timeline) {
+             hist_add(g.tl_read_kind_hist[t.kind], dt);
+             g.tl_read_kind_n[t.kind]++;
+@@ -575,8 +586,14 @@
+                 t = g.queue_lo.front();
+                 g.queue_lo.pop_front();
+             }
++            if (g.pf_admission == "time_gate") { g.pf_active_bytes += t.size; }
+         }
+         run_one_task(t);
++        if (g.pf_admission == "time_gate") {
++            std::lock_guard<std::mutex> lk(g.mtx);
++            GGML_ASSERT(g.pf_active_bytes >= t.size);
++            g.pf_active_bytes -= t.size;
++        }
+     }
+ }
+ 
+@@ -901,6 +918,9 @@
+     fprintf(f, " \"prefetch_gate_rejected_useful\": %llu,\n", (unsigned long long) g.pf_gate_rejected_useful);
+     fprintf(f, " \"prefetch_gate_rejected_wasted\": %llu,\n", (unsigned long long) g.pf_gate_rejected_wasted);
+     fprintf(f, " \"prefetch_gate_cpu_ms\": %.6f,\n", g.pf_gate_cpu_ms);
++    fprintf(f, " \"prefetch_time_gate_metadata_payload_bytes\": %zu,\n", g.layers.size() * (sizeof(g.layers[0].pf_exact_rank_observations) + sizeof(g.layers[0].pf_exact_rank_useful) + sizeof(g.layers[0].pf_lead_ewma_ms) + sizeof(g.layers[0].pf_lead_samples)));
++    fprintf(f, " \"prefetch_rejected_useful_lead_proxy_ms\": %.6f,\n", g.pf_rejected_useful_lead_proxy_ms);
++    fprintf(f, " \"prefetch_admitted_useful_lead_proxy_ms\": %.6f,\n", g.pf_admitted_useful_lead_proxy_ms);
+     fprintf(f, " \"prefetch_candidates\": %llu,\n", (unsigned long long) g.pf_candidates);
+     fprintf(f, " \"prefetch_submitted_experts\": %llu,\n", (unsigned long long) g.pf_submitted_experts);
+     fprintf(f, " \"prefetch_submitted_bytes\": %llu,\n", (unsigned long long) g.pf_submitted_bytes);
+@@ -1594,10 +1614,42 @@
+     return observations < 16 || (unsigned __int128) 4 * useful >= (unsigned __int128) 3 * observations;
+ }
+ 
++// Admission proxy only: useful head start versus wrong-read work extending
++// beyond the predicted routing window. Idle-window reads are not penalized.
++bool prefetch_time_admit(const moe_prefetch_nomination & nomination, double & gain_ms) {
++    GGML_ASSERT(nomination.useful <= nomination.observations);
++    gain_ms = 0.0;
++    if (nomination.observations < 16 || nomination.lead_samples < 16 || nomination.read_samples < 32 ||
++        !std::isfinite(nomination.read_ms) || nomination.read_ms <= 0.0 ||
++        !std::isfinite(nomination.lead_ms) || nomination.lead_ms <= 0.0 ||
++        !std::isfinite(nomination.queue_ms) || nomination.queue_ms < 0.0) { return true; }
++    const double probability = ((double) nomination.useful + 1.0) / ((double) nomination.observations + 2.0);
++    const double head_start = std::min(nomination.read_ms, std::max(0.0, nomination.lead_ms - nomination.queue_ms));
++    const double exposed_waste = std::max(0.0, nomination.queue_ms + nomination.read_ms - nomination.lead_ms);
++    gain_ms = probability * head_start - (1.0 - probability) * exposed_waste;
++    if (!std::isfinite(gain_ms)) { gain_ms = 0.0; return true; }
++    return gain_ms >= 0.0;
++}
++
+ int prefetch_select(llama_moe_paging_layer & l, const int32_t * pool, int npool, int32_t * out) {
+     const double cpu0 = thread_cpu_ms();
+     GGML_ASSERT(l.pf_nomination_n == 0);
+     int n = 0;
++    double cost_ms = 0.0, queue_ms = 0.0;
++    uint64_t read_samples = 0;
++    if (g.pf_admission == "time_gate") {
++        double unit_ms;
++        { std::lock_guard<std::mutex> lk(g.hist_m);
++          unit_ms = g.pf_read_ms_per_byte; read_samples = g.pf_read_samples; }
++        uint64_t queued_bytes;
++        { std::lock_guard<std::mutex> lk(g.mtx);
++          queued_bytes = g.pf_active_bytes;
++          for (const auto & t : g.queue_hi) { queued_bytes += t.size; }
++          for (const auto & t : g.queue_lo) { queued_bytes += t.size; } }
++        // Aggregate service-work/QD proxy, not an observed completion deadline.
++        cost_ms = unit_ms * (double) g.record_stride / (double) g.qd;
++        queue_ms = unit_ms * (double) queued_bytes / (double) g.qd;
++    }
+     for (int i = 0; i < npool && l.pf_nomination_n < g.prefetch_p; i++) {
+         const int32_t e = pool[i];
+         g.pf_candidates++;
+@@ -1607,7 +1659,20 @@
+         const int bin = std::min(i / 4, 3);
+         auto & nomination = l.pf_nominations[l.pf_nomination_n++];
+         nomination = {e, i + 1, false, false, l.pf_rank_observations[bin], l.pf_rank_useful[bin]};
+-        nomination.admitted = g.pf_admission == "all" || prefetch_rank_admit(nomination.observations, nomination.useful);
++        nomination.decision_ms = g.pf_admission == "time_gate" ? now_ms() : 0.0;
++        if (g.pf_admission == "time_gate") {
++            GGML_ASSERT(i >= 0 && i < 16);
++            nomination.observations = l.pf_exact_rank_observations[i];
++            nomination.useful = l.pf_exact_rank_useful[i];
++            nomination.lead_ms = l.pf_lead_ewma_ms;
++            nomination.lead_samples = l.pf_lead_samples;
++            nomination.read_ms = cost_ms;
++            nomination.read_samples = read_samples;
++            nomination.queue_ms = queue_ms + n * cost_ms;
++            nomination.admitted = prefetch_time_admit(nomination, nomination.expected_gain_ms);
++        } else {
++            nomination.admitted = g.pf_admission == "all" || prefetch_rank_admit(nomination.observations, nomination.useful);
++        }
+         g.pf_gate_considered++;
+         if (nomination.admitted) { out[n++] = e; } else { g.pf_gate_rejected++; }
+     }
+@@ -1615,7 +1680,7 @@
+     return n;
+ }
+ 
+-void prefetch_observe_nominations(llama_moe_paging_layer & l, const int32_t * req, int k) {
++void prefetch_observe_nominations(llama_moe_paging_layer & l, const int32_t * req, int k, double authoritative_ms = 0.0) {
+     const double cpu0 = thread_cpu_ms();
+     for (int i = 0; i < l.pf_nomination_n; ++i) {
+         const auto & nomination = l.pf_nominations[i];
+@@ -1626,9 +1691,36 @@
+         ++l.pf_rank_observations[bin];
+         l.pf_rank_useful[bin] += wanted;
+         if (!nomination.admitted) { if (wanted) { ++g.pf_gate_rejected_useful; } else { ++g.pf_gate_rejected_wasted; } }
++        if (g.pf_admission == "time_gate") {
++            const int rank = nomination.rank - 1;
++            GGML_ASSERT(rank >= 0 && rank < 16);
++            if (l.pf_exact_rank_observations[rank] == UINT64_MAX) { GGML_ABORT("prefetch exact-rank overflow"); }
++            ++l.pf_exact_rank_observations[rank];
++            l.pf_exact_rank_useful[rank] += wanted;
++            const double actual_lead = std::max(0.0, authoritative_ms - nomination.decision_ms);
++            const double proxy = std::min(actual_lead, nomination.read_ms);
++            if (wanted && !nomination.admitted) { g.pf_rejected_useful_lead_proxy_ms += proxy; }
++            if (wanted && nomination.submitted) { g.pf_admitted_useful_lead_proxy_ms += proxy; }
++        }
+         if (g.pf_decisions_f) {
+-            fprintf(g.pf_decisions_f, "%llu,%d,%d,%d,%d,%d,%d,%llu,%llu\n", (unsigned long long) g.tokens, l.il, nomination.expert, nomination.rank,
++            fprintf(g.pf_decisions_f, "%llu,%d,%d,%d,%d,%d,%d,%llu,%llu", (unsigned long long) g.tokens, l.il, nomination.expert, nomination.rank,
+                     nomination.admitted, nomination.submitted, wanted, (unsigned long long) nomination.observations, (unsigned long long) nomination.useful);
++            if (g.pf_admission == "time_gate") {
++                fprintf(g.pf_decisions_f, ",%.17g,%.17g,%.17g,%.17g,%.17g,%llu,%llu,%.17g",
++                        nomination.decision_ms, nomination.lead_ms, nomination.read_ms, nomination.queue_ms,
++                        nomination.expected_gain_ms, (unsigned long long) nomination.lead_samples,
++                        (unsigned long long) nomination.read_samples, std::max(0.0, authoritative_ms - nomination.decision_ms));
++            }
++            fprintf(g.pf_decisions_f, "\n");
++        }
++    }
++    // Update once per authoritative event, AFTER all decisions and labels.
++    if (g.pf_admission == "time_gate" && l.pf_nomination_n > 0) {
++        const double lead = std::max(0.0, authoritative_ms - l.pf_nominations[0].decision_ms);
++        if (std::isfinite(lead) && lead > 0.0) {
++            l.pf_lead_ewma_ms = l.pf_lead_samples == 0 ? lead : 0.875 * l.pf_lead_ewma_ms + 0.125 * lead;
++            if (l.pf_lead_samples == UINT64_MAX) { GGML_ABORT("prefetch lead sample overflow"); }
++            ++l.pf_lead_samples;
+         }
+     }
+     l.pf_nomination_n = 0;
+@@ -2000,7 +2092,7 @@
+         g.tl_event_a0_ms.push_back(a0dt);
+         g.tl_event_attn_ms.push_back(attndt);
+     }
+-    prefetch_observe_nominations(l, req, k);
++    prefetch_observe_nominations(l, req, k, demand_t0);
+     const bool decay = g.policy == "event_decay90";
+     if (decay) {
+         for (int s = 0; s < l.n_slots; s++) {
+@@ -3116,15 +3208,19 @@
+     }
+ 
+     g.pf_admission = getenv_str("LLAMA_MOE_PAGING_PREFETCH_ADMISSION", "all");
+-    if (g.pf_admission != "all" && g.pf_admission != "rank_gate") { GGML_ABORT("invalid prefetch admission"); }
+-    if (g.pf_admission == "rank_gate" && (!g.prefetch_enabled || g.prefetch_mode != "a0" || g.prefetch_p != 2 || g.prefetch_pool != 16)) {
+-        GGML_ABORT("rank_gate requires A0/P2/K16");
++    if (g.pf_admission != "all" && g.pf_admission != "rank_gate" && g.pf_admission != "time_gate") { GGML_ABORT("invalid prefetch admission"); }
++    if (g.pf_admission != "all" && (!g.prefetch_enabled || g.prefetch_mode != "a0" || g.prefetch_p != 2 || g.prefetch_pool != 16)) {
++        GGML_ABORT("rank_gate/time_gate requires A0/P2/K16");
+     }
+     const char * decision_path = getenv("LLAMA_MOE_PAGING_PREFETCH_DECISIONS");
+     if (decision_path && *decision_path) {
+         GGML_ASSERT(g.prefetch_enabled && g.prefetch_mode == "a0");
+         g.pf_decisions_f = fopen(decision_path, "w"); GGML_ASSERT(g.pf_decisions_f);
+-        fprintf(g.pf_decisions_f, "step,layer,expert,rank,admit,submitted,wanted,observations,useful\n");
++        fprintf(g.pf_decisions_f, "step,layer,expert,rank,admit,submitted,wanted,observations,useful");
++        if (g.pf_admission == "time_gate") {
++            fprintf(g.pf_decisions_f, ",decision_ms,lead_est_ms,read_est_ms,queue_est_ms,expected_gain_ms,lead_samples,read_samples,actual_lead_ms");
++        }
++        fprintf(g.pf_decisions_f, "\n");
+     }
+ 
+     const std::string store = getenv_str("LLAMA_MOE_PAGING_STORE", "cold-experts.bin");
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -36,6 +36,10 @@
+     int32_t expert = -1, rank = 0;
+     bool admitted = false, submitted = false;
+     uint64_t observations = 0, useful = 0;
++    // Execution 021: snapshots before this event's authoritative labels.
++    double decision_ms = 0.0, lead_ms = 0.0, read_ms = 0.0, queue_ms = 0.0;
++    double expected_gain_ms = 0.0;
++    uint64_t lead_samples = 0, read_samples = 0;
+ };
+ 
+ struct llama_moe_paging_layer {
+@@ -157,6 +161,9 @@
+     uint64_t pf_rank_observations[4] = {}, pf_rank_useful[4] = {};
+     moe_prefetch_nomination pf_nominations[32];
+     int pf_nomination_n = 0;
++    uint64_t pf_exact_rank_observations[16] = {}, pf_exact_rank_useful[16] = {};
++    double pf_lead_ewma_ms = 0.0;
++    uint64_t pf_lead_samples = 0;
+     // predictor placement lead: A0-ready -> authoritative demand
+     double                a0_ready_ms = 0.0;
+ 

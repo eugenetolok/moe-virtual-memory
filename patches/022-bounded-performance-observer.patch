@@ -1,0 +1,496 @@
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-moe-paging.h"
++#include "llama-moe-observe.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -114,6 +115,7 @@
+     int64_t offset = 0;
+     size_t  size = 0;
+     uint64_t event_id = (uint64_t) -1;  // Execution 017 C4: owning demand event
++    moe_observe_record observe;
+     tl_read_rec * tl_rec = nullptr;     // Execution 017 C4: speculative completion stamp
+ };
+ 
+@@ -402,6 +404,9 @@
+ };
+ 
+ paging_state g;
++moe_observer observer;
++bool telemetry_flush_ok = true;
++double observe_phase_ms[41][16] = {};
+ 
+ double thread_cpu_ms() {
+     struct timespec ts;
+@@ -518,7 +523,7 @@
+     }
+ }
+ 
+-void run_one_task(const io_task & t) {
++void run_one_task(const io_task & t, int worker = -1) {
+ #if defined(LLAMA_MOE_PAGING_BATCH_SELFTEST)
+     if (getenv("LLAMA_MOE_PAGING_PREFETCH_BATCHSELFTEST") != nullptr) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(120));
+@@ -537,13 +542,18 @@
+     {
+         std::lock_guard<std::mutex> lk(g.hist_m);
+         hist_add(g.hist, dt);
+-        if (g.pf_admission == "time_gate" && ok && t.size > 0 && std::isfinite(dt) && dt > 0.0) {
++        if ((g.pf_admission == "time_gate" || observer.mode) && ok && t.size > 0 && std::isfinite(dt) && dt > 0.0) {
+             const double sample = dt / (double) t.size;
+             g.pf_read_ms_per_byte = g.pf_read_samples == 0 ? sample :
+                                    0.875 * g.pf_read_ms_per_byte + 0.125 * sample;
+             if (g.pf_read_samples == UINT64_MAX) { GGML_ABORT("prefetch read sample overflow"); }
+             ++g.pf_read_samples;
+         }
++        if (observer.mode) {
++            auto record=t.observe; record.start_ms=t0; record.end_ms=done_ms;
++            record.worker=worker; record.flags |= ok?0:4;
++            record.value=g.pf_read_ms_per_byte; record.calibration_samples=g.pf_read_samples; observer.emit(record);
++        }
+         if (g.timeline) {
+             hist_add(g.tl_read_kind_hist[t.kind], dt);
+             g.tl_read_kind_n[t.kind]++;
+@@ -566,7 +576,7 @@
+     }
+ }
+ 
+-void worker_main() {
++void worker_main(int worker) {
+     for (;;) {
+         io_task t;
+         {
+@@ -586,15 +596,26 @@
+                 t = g.queue_lo.front();
+                 g.queue_lo.pop_front();
+             }
+-            if (g.pf_admission == "time_gate") { g.pf_active_bytes += t.size; }
+-        }
+-        run_one_task(t);
+-        if (g.pf_admission == "time_gate") {
++            if (g.pf_admission == "time_gate" || observer.mode) { g.pf_active_bytes += t.size; }
++        }
++        run_one_task(t, worker);
++        if (g.pf_admission == "time_gate" || observer.mode) {
+             std::lock_guard<std::mutex> lk(g.mtx);
+             GGML_ASSERT(g.pf_active_bytes >= t.size);
+             g.pf_active_bytes -= t.size;
+         }
+     }
++}
++
++void observe_queued(io_task & t, bool high) {
++    if (!observer.mode) { return; }
++    auto & r = t.observe;
++    r.id = observer.next_id.fetch_add(1); r.step = g.tokens;
++    r.layer = t.layer->il; r.expert = t.gid; r.component = t.kind;
++    r.bytes = t.size; r.offset = t.offset; r.flags = high ? 1 : 0;
++    r.enqueue_ms = now_ms(); r.active_bytes=g.pf_active_bytes;
++    for (const auto & queued : g.queue_hi) { r.high_bytes += queued.size; }
++    for (const auto & queued : g.queue_lo) { r.low_bytes += queued.size; }
+ }
+ 
+ // Returns false if any read failed.
+@@ -627,6 +648,7 @@
+         for (const auto & t : tasks) {
+             io_task copy = t;
+             copy.batch = &batch;
++            observe_queued(copy, true);
+             g.queue_hi.push_back(copy);
+         }
+     }
+@@ -672,6 +694,7 @@
+         for (const auto & t : tasks) {
+             io_task copy = t;
+             copy.batch = &p.batch;
++            observe_queued(copy, high);
+             q.push_back(copy);
+         }
+     }
+@@ -688,6 +711,7 @@
+     std::lock_guard<std::mutex> lk(g.mtx);
+     for (auto it = g.queue_lo.begin(); it != g.queue_lo.end(); ) {
+         if (it->layer == &l && it->gid == gid) {
++            if (observer.mode) { it->observe.promotion_ms = now_ms(); it->observe.flags |= 2; }
+             g.queue_hi.push_back(*it);
+             it = g.queue_lo.erase(it);
+         } else {
+@@ -864,6 +888,8 @@
+     };
+ 
+     fprintf(f, "{\n");
++    observer.stats(f);
++    fprintf(f, " \"telemetry_flush_ok\": %s,\n", telemetry_flush_ok ? "true" : "false");
+     fprintf(f, " \"mode\": \"cpu_hybrid_staging_paging\",\n");
+     fprintf(f, " \"backend\": \"%s\",\n", g.backend.c_str());
+     fprintf(f, " \"stage_mode\": \"%s\",\n", g.stage_mode.c_str());
+@@ -1296,6 +1322,7 @@
+ void atexit_handler() {
+     resident_pool_stop();
+     pool_stop();
++    telemetry_flush_ok = observer.flush();
+     if (g.ov_event_file) { fclose(g.ov_event_file); g.ov_event_file = nullptr; }
+     oracle_capture_close();
+     if (g.pf_decisions_f) { fclose(g.pf_decisions_f); g.pf_decisions_f = nullptr; }
+@@ -1673,6 +1700,10 @@
+         } else {
+             nomination.admitted = g.pf_admission == "all" || prefetch_rank_admit(nomination.observations, nomination.useful);
+         }
++        if (observer.mode) { moe_observe_record r; r.type=15; r.step=g.tokens; r.layer=l.il;
++            r.expert=e; r.component=i+1; r.bytes=nomination.observations; r.offset=(int64_t)nomination.useful;
++            r.flags=nomination.admitted?1:0; r.value=nomination.expected_gain_ms;
++            r.start_ms=r.end_ms=now_ms(); observer.emit(r); }
+         g.pf_gate_considered++;
+         if (nomination.admitted) { out[n++] = e; } else { g.pf_gate_rejected++; }
+     }
+@@ -2034,6 +2065,9 @@
+             float * out = l.early_out.data() + (size_t) i * n_emb;
+             for (int r = 0; r < n_emb; ++r) { vd(n_ff, out + r, 0, dw + r * wd->nb[1], 0, cd, 0, 1); }
+             l.early_end[i] = now_ms();
++            if (observer.mode) { moe_observe_record r; r.type=5; r.step=g.tokens; r.layer=l.il;
++                r.expert=(size_t)slots[i]<l.slot_expert.size()?l.slot_expert[slots[i]]:-1; r.component=i; r.worker=lane;
++                r.start_ms=l.early_start[i]; r.end_ms=l.early_end[i]; observer.emit(r); }
+         }
+         lane_cpu[lane] = thread_cpu_ms() - cpu0;
+     });
+@@ -2091,6 +2125,15 @@
+         g.tl_event_step.push_back(g.tokens);
+         g.tl_event_a0_ms.push_back(a0dt);
+         g.tl_event_attn_ms.push_back(attndt);
++    }
++    if (observer.mode) {
++        for (int i=0;i<k;++i) { moe_observe_record r; r.type=2; r.step=g.tokens;
++            r.layer=l.il; r.expert=req[i]; r.component=i;
++            r.offset=find_slot_state(l,req[i],ST_DEMAND); r.flags=r.offset>=0?1:0;
++            if(r.offset<0) { r.offset=find_slot_state(l,req[i],ST_READY); if(r.offset>=0) { r.flags=2; } }
++            if(r.offset<0) { r.offset=find_slot_state(l,req[i],ST_LOADING); if(r.offset>=0) { r.flags=3; } }
++            if(r.offset<0) { r.flags=4; }
++            r.start_ms=r.end_ms=demand_t0; observer.emit(r); }
+     }
+     prefetch_observe_nominations(l, req, k, demand_t0);
+     const bool decay = g.policy == "event_decay90";
+@@ -3172,6 +3215,18 @@
+     }
+     g.stats_path = getenv_str("LLAMA_MOE_PAGING_STATS", "results/moe_paging_stats.json");
+     g.stats_interval = getenv_int("LLAMA_MOE_PAGING_STATS_INTERVAL", 128);
++    const std::string telemetry = getenv_str("MOE_TELEMETRY", "off");
++    if (telemetry != "off" && telemetry != "summary" && telemetry != "trace") { GGML_ABORT("invalid MOE_TELEMETRY"); }
++    const int telemetry_budget = getenv_int("MOE_TRACE_BUDGET_MIB", 4);
++    const int telemetry_first = getenv_int("MOE_TRACE_FIRST", 46);
++    const int telemetry_count = getenv_int("MOE_TRACE_COUNT", 4);
++    const int telemetry_stride = getenv_int("MOE_TRACE_STRIDE", 1);
++    if (telemetry_budget < 1 || telemetry_budget > 32 || telemetry_first < 0 || telemetry_count < 1 || telemetry_stride < 1) { GGML_ABORT("invalid bounded telemetry settings"); }
++    const std::string telemetry_path = getenv_str("MOE_TRACE_OUTPUT", "");
++    if (telemetry == "trace" && telemetry_path.empty()) { GGML_ABORT("trace needs MOE_TRACE_OUTPUT"); }
++    if (telemetry != "off" && (g.qd <= 1 || g.compute_mode != "direct_sparse" || g.backend != "gguf3")) { GGML_ABORT("telemetry requires direct_sparse/gguf3/QD>1"); }
++    observer.init(telemetry=="off"?0:telemetry=="summary"?1:2, (size_t)telemetry_budget*1024*1024,
++                  telemetry_first, telemetry_count, telemetry_stride, telemetry_path);
+     g.fault_after = getenv_int("LLAMA_MOE_PAGING_FAULT_AFTER", 0);
+     g.direct_verify   = getenv_bool("LLAMA_MOE_PAGING_DIRECT_VERIFY", false);
+     g.direct_verify_n = std::max(1, getenv_int("LLAMA_MOE_PAGING_DIRECT_VERIFY_N", 8));
+@@ -3407,7 +3462,7 @@
+     // bounded reusable worker pool; qd == 1 stays on the calling thread
+     if (g.qd > 1) {
+         for (int i = 0; i < g.qd; i++) {
+-            g.workers.emplace_back(worker_main);
++            g.workers.emplace_back(worker_main, i);
+         }
+     }
+ 
+@@ -3829,11 +3884,13 @@
+     // Execution 017: keep the exact kernel loop in a lambda so the same path can
+     // be timed and replayed for n = 1..n_ids selected experts.
+     const bool skip_early = g.overlap_enabled && !g.overlap_verify;
+-    auto run_selected = [&](int n_sel) {
++    auto run_selected = [&](int n_sel, bool production = false) {
+         for (int jj = 0; jj < n_sel; jj++) {
+             const int j = order[jj];
+             if (skip_early && l->early_ready[j]) { continue; }
+             const int32_t s = sel[j];
++            const bool capture = observer.mode==2 && production;
++            const double compute0 = capture?now_ms():0, cpu0 = capture?thread_cpu_ms():0;
+             const char * src0_cur = (const char *) src0->data + (size_t) s * nb02;
+             const int64_t i11 = (int64_t) j % ne11;
+             GGML_ASSERT(i11 >= 0 && i11 < ne11);
+@@ -3853,6 +3910,10 @@
+                     dst_col[ir0] = tmp;
+                 }
+             }
++            if(capture) { moe_observe_record r; r.type=1; r.step=l->events?l->events-1:0;
++                r.layer=l->il; r.expert=(size_t)s<l->slot_expert.size()?l->slot_expert[s]:-1;
++                r.component=proj; r.worker=ith; r.flags=j; r.start_ms=compute0; r.end_ms=now_ms();
++                r.value=thread_cpu_ms()-cpu0; observer.emit(r); }
+         }
+     };
+ 
+@@ -3888,7 +3949,7 @@
+ 
+     const double op_t0 = (g.timeline && ith == 0) ? now_ms() : 0.0;
+ 
+-    run_selected(n_ids);
++    run_selected(n_ids, true);
+ 
+     if (g.timeline) {
+         ggml_barrier(params->threadpool);
+@@ -4136,6 +4197,8 @@
+     auto * l = (llama_moe_paging_layer *) userdata;
+     const double t = now_ms();
+     l->compute_ms += t - l->compute_start_ms;
++    if (observer.mode) { moe_observe_record r; r.type=3; r.layer=l->il; r.step=l->events?l->events-1:0;
++        r.start_ms=l->compute_start_ms; r.end_ms=t; observer.emit(r); }
+     if (g.timeline && l->tl_demand_unblock_ms > 0.0) {
+         g.tl_expert_ms += t - l->tl_demand_unblock_ms;
+         g.tl_expert_n++;
+@@ -4182,3 +4245,34 @@
+ extern "C" bool llama_moe_paging_direct_mul_mat_id(struct ggml_compute_params * params, struct ggml_tensor * op) {
+     return llama_moe_paging_direct_mul_mat_id_impl(params, op);
+ }
++
++// Execution 022 passive graph landmarks. userdata encodes (phase*64 + layer+1).
++bool llama_moe_observe_enabled() { return g.enabled && observer.mode; }
++void llama_moe_observe_marker(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
++    GGML_UNUSED(dst); GGML_UNUSED(a); GGML_UNUSED(nth);
++    if (ith != 0 || !observer.mode) { return; }
++    const uintptr_t tag=(uintptr_t)userdata; const int phase=(int)(tag/64), layer=(int)(tag%64)-1;
++    moe_observe_record r; r.type=phase; r.layer=layer;
++    r.step = phase>=10 && g.tokens ? g.tokens-1 : g.tokens;
++    if (layer>=0 && phase>=8 && (size_t)layer<g.layers.size() && g.layers[layer].events) { r.step=g.layers[layer].events-1; }
++    r.start_ms=r.end_ms=now_ms();
++    const int index=layer<0?40:layer;
++    GGML_ASSERT(index>=0 && index<=40 && phase>=0 && phase<16);
++    const int previous=phase==7?6:phase==8?7:phase==9?8:phase==11?10:phase==12?11:phase==14?13:-1;
++    if (previous>=0 && observe_phase_ms[index][previous]>0) { r.start_ms=observe_phase_ms[index][previous]; }
++    observe_phase_ms[index][phase]=r.end_ms;
++    observer.emit(r);
++}
++
++void llama_moe_observe_a0(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * ids,
++                         const ggml_tensor * scores, int ith, int nth, void * userdata) {
++    if (ith==0 && observer.mode) {
++        auto * l=(llama_moe_paging_layer *)userdata;
++        for(int i=0;i<ids->ne[0];++i) { const int expert=*(const int32_t*)((const char*)ids->data+i*ids->nb[0]);
++            GGML_ASSERT(expert>=0 && expert<scores->ne[0] && scores->type==GGML_TYPE_F32);
++            moe_observe_record r; r.type=4; r.step=g.tokens; r.layer=l->il; r.expert=expert; r.component=i+1;
++            r.value=*(const float*)((const char*)scores->data+expert*scores->nb[0]); r.start_ms=r.end_ms=now_ms(); observer.emit(r);
++        }
++    }
++    llama_moe_paging_prefetch_a0(dst,a,ids,ith,nth,userdata);
++}
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -303,3 +303,9 @@
+                                   int ith, int nth, void * userdata);
+ void llama_moe_paging_shexp_end(ggml_tensor * dst, const ggml_tensor * a,
+                                 int ith, int nth, void * userdata);
++
++// Passive telemetry landmarks; unavailable/off unless requested at process start.
++bool llama_moe_observe_enabled();
++void llama_moe_observe_marker(ggml_tensor *, const ggml_tensor *, int, int, void *);
++
++void llama_moe_observe_a0(ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, void *);
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -190,6 +190,11 @@
+     inpL = build_inp_embd(model.tok_embd);
+ 
+     cb(inpL, "model.input_embed", -1);
++    auto observe = [&](ggml_tensor * input, int phase, int layer) {
++        if (!llama_moe_observe_enabled()) { return input; }
++        return ggml_map_custom1_inplace(ctx0, input, llama_moe_observe_marker, 1,
++                                       (void *)(uintptr_t)(phase*64+layer+1));
++    };
+ 
+     auto * inp = build_inp_mem_hybrid();
+ 
+@@ -198,6 +203,7 @@
+ 
+     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+     for (int il = 0; il < n_layer; ++il) {
++        inpL = observe(inpL, 6, il);
+         res->t_layer_inp[il] = inpL;
+ 
+         // Execution 014: pre_attn oracle starts the exact same-layer reads at the
+@@ -251,10 +257,15 @@
+                 cb(a0, "ffn_moe_pf_logits", il);
+                 a0 = ggml_soft_max(ctx0, a0);
+                 cb(a0, "ffn_moe_pf_probs", il);
++                ggml_tensor * a0_scores = a0;
+                 a0 = ggml_argsort_top_k(ctx0, a0, llama_moe_paging_prefetch_pool());
+                 cb(a0, "ffn_moe_pf_topk", il);
+ 
+-                inpL = ggml_map_custom2(ctx0, inpL, a0, llama_moe_paging_prefetch_a0, 1, moe_page_pf);
++                if (llama_moe_observe_enabled()) {
++                    inpL = ggml_map_custom3(ctx0, inpL, a0, a0_scores, llama_moe_observe_a0, 1, moe_page_pf);
++                } else {
++                    inpL = ggml_map_custom2(ctx0, inpL, a0, llama_moe_paging_prefetch_a0, 1, moe_page_pf);
++                }
+                 cb(inpL, "ffn_moe_pf_a0", il);
+             }
+         } else if (llama_moe_paging_prefetch_oracle_mode()) {
+@@ -286,6 +297,7 @@
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+ 
++        cur = observe(cur, 7, il);
+         // Residual connection
+         cur = ggml_add(ctx0, cur, inpSA);
+         cb(cur, "attn_residual", il);
+@@ -299,6 +311,7 @@
+ 
+         // MOE FFN layer
+         cur = build_layer_ffn(attn_post_norm, il);
++        cur = observe(cur, 8, il);
+         cb(cur, "ffn_out", il);
+ 
+         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
+@@ -309,9 +322,9 @@
+         cb(cur, "l_out", il);
+ 
+         // Input for next layer
+-        inpL = cur;
+-    }
+-    cur = inpL;
++        inpL = observe(cur, 9, il);
++    }
++    cur = observe(inpL, 10, -1);
+ 
+     // post-norm hidden state feeds both the LM head and the MTP seed below
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+@@ -323,12 +336,14 @@
+         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     }
+ 
++    cur = observe(cur, 11, -1);
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+     // LM head
+     cur = build_lora_mm(model.output, cur, model.output_s);
+ 
++    cur = observe(cur, 12, -1);
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ 
+@@ -611,6 +626,7 @@
+                 cur = ggml_map_custom1(ctx0, cur, llama_moe_paging_shexp_start, 1, shexp_page);
+             }
+         }
++        if (llama_moe_observe_enabled()) { cur = ggml_map_custom1_inplace(ctx0, cur, llama_moe_observe_marker, 1, (void *)(uintptr_t)(13*64+il+1)); }
+         ggml_tensor * ffn_shexp =
+             build_ffn(cur,
+                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+@@ -633,6 +649,7 @@
+ 
+         // Apply the gate to the shared expert output
+         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
++        if (llama_moe_observe_enabled()) { ffn_shexp = ggml_map_custom1_inplace(ctx0, ffn_shexp, llama_moe_observe_marker, 1, (void *)(uintptr_t)(14*64+il+1)); }
+         cb(ffn_shexp, "ffn_shexp_gated", il);
+ 
+         if (shexp_page != nullptr) {
+--- /dev/null
++++ b/src/llama-moe-observe.h
+@@ -0,0 +1,102 @@
++#pragma once
++// Bounded, passive observer. No I/O on the inference/worker hot path.
++#include <atomic>
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <memory>
++#include <string>
++
++struct moe_observe_record {
++    uint64_t id = 0, step = 0, bytes = 0;
++    int64_t offset = 0;
++    int32_t type = 0, layer = -1, expert = -1, component = -1, worker = -1, flags = 0;
++    double enqueue_ms = 0, start_ms = 0, end_ms = 0, promotion_ms = 0;
++    uint64_t high_bytes = 0, low_bytes = 0;
++    double value = 0;
++    uint64_t active_bytes = 0, calibration_samples = 0;
++};
++
++struct moe_observer {
++    // 0 off, 1 summary, 2 trace. Changes only at initialization.
++    int mode = 0;
++    uint64_t first = 0, count = UINT64_MAX, stride = 1;
++    size_t capacity = 0;
++    std::string path;
++    std::unique_ptr<moe_observe_record[]> records;
++    std::atomic<uint64_t> cursor{0}, dropped{0}, next_id{1};
++    std::array<std::atomic<uint64_t>, 16> events{}, bytes{}, duration_ns{}, queue_ns{};
++    std::array<std::atomic<uint64_t>, 64> read_hist{};
++    std::array<std::atomic<uint64_t>, 4096> ordinary_step_bytes{}, prefetch_step_bytes{};
++    std::atomic<uint64_t> step_bytes_overflow{0};
++
++    moe_observer() {
++        for(auto & a:events) { a.store(0); } for(auto & a:bytes) { a.store(0); }
++        for(auto & a:duration_ns) { a.store(0); } for(auto & a:queue_ns) { a.store(0); }
++        for(auto & a:read_hist) { a.store(0); }
++        for(auto & a:ordinary_step_bytes) { a.store(0); } for(auto & a:prefetch_step_bytes) { a.store(0); }
++    }
++    void init(int m, size_t budget, uint64_t start, uint64_t n, uint64_t every, const std::string & output) {
++        mode = m; first = start; count = n; stride = every; path = output;
++        capacity = m == 2 ? budget / sizeof(moe_observe_record) : 0;
++        if (capacity) { records.reset(new moe_observe_record[capacity]); }
++    }
++    bool selected(uint64_t step) const {
++        return step >= first && step - first < count && (step - first) % stride == 0;
++    }
++    static uint64_t nanos(double ms) {
++        return std::isfinite(ms) && ms > 0 ? (uint64_t) (ms * 1e6) : 0;
++    }
++    void emit(const moe_observe_record & r) {
++        if (!mode) { return; }
++        const unsigned type = (unsigned) r.type;
++        if (type >= events.size()) { return; }
++        events[type].fetch_add(1, std::memory_order_relaxed);
++        bytes[type].fetch_add(r.bytes, std::memory_order_relaxed);
++        duration_ns[type].fetch_add(nanos(r.end_ms-r.start_ms), std::memory_order_relaxed);
++        queue_ns[type].fetch_add(nanos(r.enqueue_ms>0 ? r.start_ms-r.enqueue_ms : 0), std::memory_order_relaxed);
++        if (type == 0) {
++            if (r.step < ordinary_step_bytes.size()) {
++                auto & ledger = (r.flags & 1) ? ordinary_step_bytes : prefetch_step_bytes;
++                ledger[r.step].fetch_add(r.bytes, std::memory_order_relaxed);
++            } else { step_bytes_overflow.fetch_add(r.bytes, std::memory_order_relaxed); }
++            double us = std::max(0.0, (r.end_ms-r.start_ms)*1000);
++            unsigned b = 0; while (us > 1 && b < 63) { us /= 2; ++b; }
++            read_hist[b].fetch_add(1, std::memory_order_relaxed);
++        }
++        if (mode != 2 || !selected(r.step)) { return; }
++        const uint64_t index = cursor.fetch_add(1, std::memory_order_relaxed);
++        if (index >= capacity) { dropped.fetch_add(1, std::memory_order_relaxed); return; }
++        records[index] = r; // unique producer slot; read only after all workers join
++    }
++    void stats(FILE * f) const {
++        fprintf(f, " \"telemetry_schema\": 1,\n \"telemetry_mode\": %d,\n \"telemetry_record_bytes\": %zu,\n \"telemetry_buffer_bytes\": %zu,\n \"telemetry_dropped\": %llu,\n", mode, sizeof(moe_observe_record), capacity*sizeof(moe_observe_record), (unsigned long long) dropped.load());
++        fprintf(f, " \"telemetry_summary\": [");
++        for (size_t i=0;i<events.size();++i) {
++            fprintf(f, "%s{\"type\":%zu,\"events\":%llu,\"bytes\":%llu,\"work_ms\":%.9f,\"queue_ms\":%.9f}", i?",":"", i, (unsigned long long)events[i].load(), (unsigned long long)bytes[i].load(), duration_ns[i].load()/1e6, queue_ns[i].load()/1e6);
++        }
++        fprintf(f, "],\n \"telemetry_read_hist_log2_us\": [");
++        for(size_t i=0;i<read_hist.size();++i) { fprintf(f,"%s%llu",i?",":"",(unsigned long long)read_hist[i].load()); }
++        fprintf(f,"] ,\n");
++        fprintf(f," \"telemetry_fixed_metadata_bytes\": %zu,\n \"telemetry_step_bytes_overflow\": %llu,\n",sizeof(*this),(unsigned long long)step_bytes_overflow.load());
++        for(int arm=0;arm<2;++arm) {
++            const auto & ledger=arm?prefetch_step_bytes:ordinary_step_bytes;
++            fprintf(f," \"telemetry_%s_step_bytes\": [",arm?"prefetch":"ordinary");
++            size_t end=ledger.size(); while(end && ledger[end-1].load()==0) { --end; }
++            for(size_t i=0;i<end;++i) { fprintf(f,"%s%llu",i?",":"",(unsigned long long)ledger[i].load()); }
++            fprintf(f,"],\n");
++        }
++    }
++    bool flush() const {
++        if (mode != 2) { return true; }
++        FILE * f = fopen(path.c_str(), "w"); if (!f) { return false; }
++        fprintf(f,"id,step,type,layer,expert,component,worker,flags,bytes,offset,enqueue_ms,start_ms,end_ms,promotion_ms,high_bytes,low_bytes,value,active_bytes,calibration_samples\n");
++        const size_t n=std::min<uint64_t>(cursor.load(),capacity);
++        for(size_t i=0;i<n;++i) { const auto & r=records[i];
++            fprintf(f,"%llu,%llu,%d,%d,%d,%d,%d,%d,%llu,%lld,%.17g,%.17g,%.17g,%.17g,%llu,%llu,%.17g,%llu,%llu\n",(unsigned long long)r.id,(unsigned long long)r.step,r.type,r.layer,r.expert,r.component,r.worker,r.flags,(unsigned long long)r.bytes,(long long)r.offset,r.enqueue_ms,r.start_ms,r.end_ms,r.promotion_ms,(unsigned long long)r.high_bytes,(unsigned long long)r.low_bytes,r.value,(unsigned long long)r.active_bytes,(unsigned long long)r.calibration_samples);
++        }
++        const bool ok=ferror(f)==0; return fclose(f)==0 && ok;
++    }
++};

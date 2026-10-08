@@ -1,0 +1,559 @@
+diff --git a/src/llama-moe-paging.cpp b/src/llama-moe-paging.cpp
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -24,6 +24,8 @@
+ #include <string>
+ #include <sys/stat.h>
+ #include <thread>
++#include <time.h>
++#include <functional>
+ #include <unistd.h>
+ #include <vector>
+ 
+@@ -78,6 +80,7 @@
+ struct read_batch {
+     std::atomic<int>  remaining {0};
+     std::atomic<bool> failed {false};
++    std::atomic<double> done_ms {0.0};
+     std::mutex m;
+     std::condition_variable cv;
+ };
+@@ -335,7 +338,23 @@
+     // Execution 017 Part D: prototype overlap of ready resident compute with cold reads
+     bool     overlap_enabled = false;
+     bool     overlap_verify = false;
+-    bool     ov_skip = false;
++    int      ov_threads = 4;
++    bool     ov_metrics = false;
++    FILE *   ov_event_file = nullptr;
++    double   ov_join_done_ms = 0.0;
++    double   ov_achieved_ms = 0.0;
++    double   ov_cpu_ms = 0.0;
++    double   ov_idle_wait_ms = 0.0;
++    double   ov_dup_cpu_ms = 0.0;
++    uint64_t ov_masks[256] = {};
++    // One fixed resident-expert job per selected position; never a graph executor.
++    std::mutex ov_m;
++    std::condition_variable ov_start, ov_done;
++    std::vector<std::thread> ov_workers;
++    std::function<void(int)> ov_job;
++    uint64_t ov_epoch = 0;
++    int ov_running = 0;
++    bool ov_stop = false;
+     uint64_t ov_events = 0;
+     uint64_t ov_experts = 0;
+     double   ov_ms = 0.0;
+@@ -349,6 +368,7 @@
+     std::vector<float>   ov_fbuf;
+     std::vector<uint8_t> ov_inbuf;
+     std::vector<uint8_t> ov_actbuf;
++    std::vector<uint8_t> ov_upinbuf;
+     std::vector<float>  tl_bench_scratch;
+     float tl_bench_scale = 1.0f;
+ 
+@@ -374,6 +394,47 @@
+ 
+ paging_state g;
+ 
++double thread_cpu_ms() {
++    struct timespec ts;
++    GGML_ASSERT(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
++void resident_pool_stop() {
++    { std::lock_guard<std::mutex> lk(g.ov_m); g.ov_stop = true; }
++    g.ov_start.notify_all();
++    for (auto & w : g.ov_workers) { w.join(); }
++    g.ov_workers.clear();
++}
++
++void resident_parallel(const std::function<void(int)> & job) {
++    if (g.ov_threads == 1) { job(0); return; }
++    if (g.ov_workers.empty()) {
++        g.ov_stop = false;
++        for (int lane = 1; lane < g.ov_threads; ++lane) {
++            g.ov_workers.emplace_back([lane, initial_epoch = g.ov_epoch]() {
++                uint64_t seen = initial_epoch;
++                std::unique_lock<std::mutex> lk(g.ov_m);
++                for (;;) {
++                    g.ov_start.wait(lk, [&] { return g.ov_stop || g.ov_epoch != seen; });
++                    if (g.ov_stop) { return; }
++                    seen = g.ov_epoch;
++                    lk.unlock();
++                    g.ov_job(lane);
++                    lk.lock();
++                    if (--g.ov_running == 0) { g.ov_done.notify_one(); }
++                }
++            });
++        }
++    }
++    { std::lock_guard<std::mutex> lk(g.ov_m);
++      g.ov_job = job; g.ov_running = g.ov_threads - 1; ++g.ov_epoch; }
++    g.ov_start.notify_all();
++    job(0);
++    { std::unique_lock<std::mutex> lk(g.ov_m);
++      g.ov_done.wait(lk, [] { return g.ov_running == 0; }); }
++}
++
+ bool llama_moe_paging_direct_storage() {
+     return g.compute_mode == "direct_sparse" || g.compute_mode == "direct_dense";
+ }
+@@ -483,6 +544,7 @@
+             b->failed.store(true);
+         }
+         if (--b->remaining == 0) {
++            b->done_ms.store(done_ms);
+             b->cv.notify_all();
+         }
+     }
+@@ -576,8 +638,10 @@
+             }
+             if (!ok) { p.ok = false; break; }
+         }
++        p.batch.done_ms.store(now_ms());
+         return;
+     }
++    p.batch.done_ms.store(0.0);
+     p.batch.remaining.store((int) tasks.size());
+     p.batch.failed.store(false);
+     {
+@@ -965,6 +1029,11 @@
+     fprintf(f, " \"tl_miss_gate_bytes\": %llu,\n", (unsigned long long) g.tl_miss_gate_bytes);
+     fprintf(f, " \"tl_miss_up_bytes\": %llu,\n", (unsigned long long) g.tl_miss_up_bytes);
+     fprintf(f, " \"tl_miss_down_bytes\": %llu,\n", (unsigned long long) g.tl_miss_down_bytes);
++    fprintf(f, " \"overlap_threads\": %d,\n", g.ov_threads);
++    fprintf(f, " \"ov_achieved_ms\": %.6f,\n", g.ov_achieved_ms);
++    fprintf(f, " \"ov_cpu_ms\": %.6f,\n", g.ov_cpu_ms);
++    fprintf(f, " \"ov_idle_wait_ms\": %.6f,\n", g.ov_idle_wait_ms);
++    fprintf(f, " \"ov_dup_cpu_proxy_ms\": %.6f,\n", g.ov_dup_cpu_ms);
+     fprintf(f, " \"ov_events\": %llu,\n", (unsigned long long) g.ov_events);
+     fprintf(f, " \"ov_experts\": %llu,\n", (unsigned long long) g.ov_experts);
+     fprintf(f, " \"ov_ms\": %.3f,\n", g.ov_ms);
+@@ -1188,7 +1257,9 @@
+ }
+ 
+ void atexit_handler() {
++    resident_pool_stop();
+     pool_stop();
++    if (g.ov_event_file) { fclose(g.ov_event_file); g.ov_event_file = nullptr; }
+     oracle_capture_close();
+     if (g.pf_seq_f != nullptr) {
+         fclose(g.pf_seq_f);
+@@ -1465,6 +1536,7 @@
+         }
+         const double j0 = now_ms();
+         wait_read_tasks(*it->p);
++        g.ov_join_done_ms = std::max(g.ov_join_done_ms, it->p->batch.done_ms.load());
+         const double jdt = now_ms() - j0;
+         g.pf_join_batches++;
+         g.pf_join_wait_ms += jdt;
+@@ -1731,86 +1803,103 @@
+ void early_compute_ready(llama_moe_paging_layer & l, int k,
+                          const bool * is_demand, const int * hit_slot,
+                          const int * pf_slot, const bool * pf_was_loading) {
+-    for (int i = 0; i < 8; i++) {
+-        l.early_ready[i] = false;
+-    }
++    std::fill(l.early_ready, l.early_ready + 8, false);
+     l.early_n = 0;
+-    if (!g.overlap_enabled || l.early_in == nullptr) {
+-        return;
+-    }
+-    const ggml_tensor * in = l.early_in;
+-    const ggml_tensor * wg = l.slot_gate;
+-    const ggml_tensor * wu = l.slot_up;
+-    const ggml_tensor * wd = l.slot_down;
+-    if (wg == nullptr || wu == nullptr || wd == nullptr || in->type != GGML_TYPE_F32) {
+-        return;
+-    }
+-    const int64_t ne_in = wg->ne[0];
+-    const int64_t n_ff  = wg->ne[1];
+-    const int64_t n_emb = wd->ne[1];
+-    const ggml_type gt = wg->type, ut = wu->type, dt = wd->type;
+-    const ggml_type gv = ggml_get_type_traits_cpu(gt)->vec_dot_type;
+-    const ggml_type dv = ggml_get_type_traits_cpu(dt)->vec_dot_type;
+-    const ggml_vec_dot_t vg = ggml_get_type_traits_cpu(gt)->vec_dot;
+-    const ggml_vec_dot_t vu = ggml_get_type_traits_cpu(ut)->vec_dot;
+-    const ggml_vec_dot_t vd = ggml_get_type_traits_cpu(dt)->vec_dot;
+-    const size_t rs_g = ggml_row_size(gv, ne_in);
++    if (!g.overlap_enabled || !l.early_in) { return; }
++    GGML_ASSERT(k <= 8 && l.early_in->type == GGML_TYPE_F32);
++    bool any_ready = false;
++    for (int i = 0; i < k; ++i) { any_ready |= is_demand[i] || (pf_slot[i] >= 0 && !pf_was_loading[i]); }
++    if (!any_ready) { ++g.ov_masks[0]; return; }
++    const auto * wg = l.slot_gate; const auto * wu = l.slot_up; const auto * wd = l.slot_down;
++    GGML_ASSERT(wg && wu && wd);
++    const int n_in = wg->ne[0], n_ff = wg->ne[1], n_emb = wd->ne[1];
++    const auto gv = ggml_get_type_traits_cpu(wg->type)->vec_dot_type;
++    const auto uv = ggml_get_type_traits_cpu(wu->type)->vec_dot_type;
++    const auto dv = ggml_get_type_traits_cpu(wd->type)->vec_dot_type;
++    const auto vg = ggml_get_type_traits_cpu(wg->type)->vec_dot;
++    const auto vu = ggml_get_type_traits_cpu(wu->type)->vec_dot;
++    const auto vd = ggml_get_type_traits_cpu(wd->type)->vec_dot;
++    const size_t rs_g = ggml_row_size(gv, n_in), rs_u = ggml_row_size(uv, n_in);
+     const size_t rs_d = ggml_row_size(dv, n_ff);
+-    if (g.ov_fbuf.size() < (size_t) 3 * (size_t) n_ff) {
+-        g.ov_fbuf.resize((size_t) 3 * (size_t) n_ff);
+-    }
+-    if (g.ov_inbuf.size() < rs_g) { g.ov_inbuf.resize(rs_g); }
+-    if (g.ov_actbuf.size() < rs_d) { g.ov_actbuf.resize(rs_d); }
+-    float * gate = g.ov_fbuf.data();
+-    float * up   = gate + n_ff;
+-    float * act  = up + n_ff;
+-    const uint8_t * cin = nullptr;
+-    if (in->type == gv) {
+-        cin = (const uint8_t *) in->data;
+-    } else {
+-        ggml_get_type_traits_cpu(gv)->from_float((const float *) in->data, g.ov_inbuf.data(), ne_in);
+-        cin = g.ov_inbuf.data();
+-    }
+-    if (l.early_out.size() < (size_t) k * (size_t) n_emb) {
+-        l.early_out.resize((size_t) k * (size_t) n_emb);
+-    }
+-    for (int i = 0; i < k; i++) {
+-        const bool ready = is_demand[i] || (pf_slot[i] >= 0 && !pf_was_loading[i]);
+-        if (!ready) { continue; }
+-        const int32_t slot = is_demand[i] ? hit_slot[i] : pf_slot[i];
+-        if (slot < 0 || slot >= wg->ne[2]) { continue; }
+-        const char * gw_slot = (const char *) wg->data + (size_t) slot * wg->nb[2];
+-        const char * uw_slot = (const char *) wu->data + (size_t) slot * wu->nb[2];
+-        const char * dw_slot = (const char *) wd->data + (size_t) slot * wd->nb[2];
+-        for (int64_t r = 0; r < n_ff; r++) {
+-            float tmp = 0.0f;
+-            vg((int) ne_in, &tmp, 0, gw_slot + (size_t) r * wg->nb[1], 0, cin, 0, 1);
+-            gate[r] = tmp;
+-            tmp = 0.0f;
+-            vu((int) ne_in, &tmp, 0, uw_slot + (size_t) r * wu->nb[1], 0, cin, 0, 1);
+-            up[r] = tmp;
+-        }
+-        const double sw_t0 = now_ms();
+-        ggml_vec_swiglu_f32((int) n_ff, act, gate, up);
+-        g.ov_dup_ms += now_ms() - sw_t0;  // the graph activation recomputes this for ready columns
+-        const uint8_t * cd = nullptr;
+-        if (dt == dv) {
+-            cd = (const uint8_t *) act;
+-        } else {
+-            ggml_get_type_traits_cpu(dv)->from_float(act, g.ov_actbuf.data(), n_ff);
+-            cd = g.ov_actbuf.data();
+-        }
+-        float * d = l.early_out.data() + (size_t) i * (size_t) n_emb;
+-        for (int64_t r = 0; r < n_emb; r++) {
+-            float tmp = 0.0f;
+-            vd((int) n_ff, &tmp, 0, dw_slot + (size_t) r * wd->nb[1], 0, cd, 0, 1);
+-            d[r] = tmp;
+-        }
+-        l.early_ready[i] = true;
+-        l.early_n++;
+-    }
+-    const int64_t sb = (int64_t) (l.early_out.size() * sizeof(float) + g.ov_fbuf.size() * sizeof(float) + g.ov_inbuf.size() + g.ov_actbuf.size());
+-    if (sb > g.ov_scratch_bytes) { g.ov_scratch_bytes = sb; }
++    g.ov_inbuf.resize(rs_g); g.ov_upinbuf.resize(rs_u);
++    g.ov_actbuf.resize(k * rs_d);
++    g.ov_fbuf.resize(k * (size_t) n_ff);
++    l.early_gate.resize(k * (size_t) n_ff); l.early_up.resize(k * (size_t) n_ff);
++    l.early_out.resize(k * (size_t) n_emb);
++    l.early_act.resize(k * (size_t) n_ff);
++    const double conv_cpu = thread_cpu_ms();
++    ggml_get_type_traits_cpu(gv)->from_float((const float *) l.early_in->data, g.ov_inbuf.data(), n_in);
++    if (uv != gv) {
++        ggml_get_type_traits_cpu(uv)->from_float((const float *) l.early_in->data, g.ov_upinbuf.data(), n_in);
++    }
++    const double extra_conversion_cpu = thread_cpu_ms() - conv_cpu;
++    g.ov_dup_cpu_ms += extra_conversion_cpu;
++    g.ov_dup_ms += extra_conversion_cpu;
++    ++g.ov_dup_experts;
++    g.ov_cpu_ms += extra_conversion_cpu;
++    int slots[8];
++    unsigned mask = 0;
++    for (int i = 0; i < k; ++i) {
++        l.early_ready[i] = is_demand[i] || (pf_slot[i] >= 0 && !pf_was_loading[i]);
++        slots[i] = is_demand[i] ? hit_slot[i] : pf_slot[i];
++        if (l.early_ready[i]) { GGML_ASSERT(slots[i] >= 0 && slots[i] < wg->ne[2]); mask |= 1u << i; ++l.early_n; }
++    }
++    ++g.ov_masks[mask];
++    double lane_cpu[8] = {};
++    resident_parallel([&](int lane) {
++        const double cpu0 = thread_cpu_ms();
++        for (int i = lane; i < k; i += g.ov_threads) {
++            if (!l.early_ready[i]) { continue; }
++            l.early_start[i] = now_ms();
++            float * gate = l.early_gate.data() + (size_t) i * n_ff;
++            float * up = l.early_up.data() + (size_t) i * n_ff;
++            float * act = l.early_act.data() + (size_t) i * n_ff;
++            const char * gw = (const char *) wg->data + (size_t) slots[i] * wg->nb[2];
++            const char * uw = (const char *) wu->data + (size_t) slots[i] * wu->nb[2];
++            const char * dw = (const char *) wd->data + (size_t) slots[i] * wd->nb[2];
++            for (int r = 0; r < n_ff; ++r) {
++                vg(n_in, gate + r, 0, gw + r * wg->nb[1], 0, g.ov_inbuf.data(), 0, 1);
++                vu(n_in, up + r, 0, uw + r * wu->nb[1], 0,
++                   uv == gv ? g.ov_inbuf.data() : g.ov_upinbuf.data(), 0, 1);
++            }
++            l.early_act_start[i] = now_ms();
++            ggml_vec_swiglu_f32(n_ff, act, gate, up);
++            l.early_act_end[i] = now_ms();
++            auto * cd = g.ov_actbuf.data() + (size_t) i * rs_d;
++            ggml_get_type_traits_cpu(dv)->from_float(act, cd, n_ff);
++            float * out = l.early_out.data() + (size_t) i * n_emb;
++            for (int r = 0; r < n_emb; ++r) { vd(n_ff, out + r, 0, dw + r * wd->nb[1], 0, cd, 0, 1); }
++            l.early_end[i] = now_ms();
++        }
++        lane_cpu[lane] = thread_cpu_ms() - cpu0;
++    });
++    for (int lane = 0; lane < g.ov_threads; ++lane) {
++        g.ov_cpu_ms += lane_cpu[lane];
++    }
++    size_t scratch = g.ov_fbuf.capacity() * sizeof(float) + g.ov_inbuf.capacity() +
++        g.ov_upinbuf.capacity() + g.ov_actbuf.capacity();
++    for (const auto & layer : g.layers) {
++        scratch += (layer.early_gate.capacity() + layer.early_up.capacity() + layer.early_out.capacity() + layer.early_act.capacity()) * sizeof(float);
++    }
++    g.ov_scratch_bytes = std::max(g.ov_scratch_bytes, (int64_t) scratch);
++}
++
++// Union of useful expert intervals intersected with still-pending authoritative I/O.
++// Includes exact activation, which the graph reuses instead of recomputing.
++double early_interval_overlap(const llama_moe_paging_layer & l, double submit, double done) {
++    std::vector<std::pair<double, double>> spans;
++    for (int i = 0; i < 8; ++i) {
++        if (!l.early_ready[i]) { continue; }
++        auto span = std::make_pair(std::max(l.early_start[i], submit), std::min(l.early_end[i], done));
++        if (span.second > span.first) { spans.push_back(span); }
++    }
++    std::sort(spans.begin(), spans.end());
++    double total = 0, end = submit;
++    for (const auto & span : spans) {
++        total += std::max(0.0, span.second - std::max(end, span.first));
++        end = std::max(end, span.second);
++    }
++    return total;
+ }
+ 
+ void stage_event_prefetch(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
+@@ -1966,18 +2055,24 @@
+             promote_prefetch_tasks(l, req[i]);
+         }
+     }
+-    // Execution 017 Part D: exact ready resident work while the cold reads are in flight
+-    if (g.overlap_enabled) {
++    g.ov_join_done_ms = 0.0;
++    const bool has_cold = !tasks.empty() || std::any_of(pf_was_loading, pf_was_loading + k, [](bool v) { return v; });
++    std::fill(l.early_ready, l.early_ready + 8, false); l.early_n = 0;
++    const double early_start = now_ms();
++    const double early_cpu0 = g.ov_cpu_ms, dup_cpu0 = g.ov_dup_cpu_ms;
++    // Execution 018: no early work when all selected weights are already ready.
++    if (g.overlap_enabled && has_cold) {
+         const double ov_t0 = now_ms();
+         early_compute_ready(l, k, is_demand, hit_slot, pf_slot, pf_was_loading);
+         g.ov_ms += now_ms() - ov_t0;
+         if (l.early_n > 0) {
+             g.ov_events++;
+             g.ov_experts += (uint64_t) l.early_n;
+-            g.ov_ready_before_unblock += (uint64_t) l.early_n;
+-            g.ov_dup_experts += (uint64_t) l.early_n;
+-        }
+-    }
++            // Only input conversion is duplicated; activation is reused exactly.
++        }
++    }
++    const double early_end = now_ms();
++    const double join_start = now_ms();
+     for (int i = 0; i < k; i++) {
+         if (!pf_was_loading[i]) {
+             continue;
+@@ -1997,7 +2092,25 @@
+         }
+     }
+     const bool ord_ok = wait_read_tasks(rp);
+-    const double wait_dt = now_ms() - wait0;
++    const double unblock = now_ms();
++    const double wait_dt = unblock - wait0;
++    const double idle_wait = unblock - join_start;
++    const double cold_done = has_cold ? std::max(rp.batch.done_ms.load(), g.ov_join_done_ms) : wait0;
++    GGML_ASSERT(!has_cold || cold_done > 0.0);
++    const double achieved = has_cold ? early_interval_overlap(l, wait0, cold_done) : 0.0;
++    int finished = 0, outstanding = 0;
++    for (int i = 0; i < k; ++i) {
++        if (!l.early_ready[i]) { continue; }
++        if (l.early_end[i] <= cold_done) { ++finished; } else { ++outstanding; }
++    }
++    g.ov_ready_before_unblock += finished; g.ov_ready_outstanding += outstanding;
++    g.ov_achieved_ms += achieved; g.ov_idle_wait_ms += idle_wait;
++    if (g.ov_event_file) {
++        fprintf(g.ov_event_file, "%llu,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%.6f\n",
++            (unsigned long long) g.tokens, l.il, l.early_n, has_cold ? 1 : 0,
++            wait0, cold_done, early_start, early_end, g.ov_cpu_ms - early_cpu0,
++            achieved, idle_wait, finished, outstanding, g.ov_dup_cpu_ms - dup_cpu0);
++    }
+     if (g.timeline) {
+         l.tl_demand_unblock_ms = now_ms();
+         g.tl_demand_io_ms += wait_dt;
+@@ -2881,6 +2994,13 @@
+     g.direct_bench_stride = std::max(1, getenv_int("LLAMA_MOE_PAGING_DIRECT_BENCH_STRIDE", 64));
+     g.overlap_enabled = getenv_bool("LLAMA_MOE_PAGING_OVERLAP", false);
+     g.overlap_verify = getenv_bool("LLAMA_MOE_PAGING_OVERLAP_VERIFY", false);
++    g.ov_threads = std::max(1, std::min(8, getenv_int("LLAMA_MOE_PAGING_OVERLAP_THREADS", 4)));
++    const char * events = getenv("LLAMA_MOE_PAGING_OVERLAP_EVENTS");
++    g.ov_metrics = g.overlap_enabled || (events && *events);
++    if (events && *events) {
++        g.ov_event_file = fopen(events, "w"); GGML_ASSERT(g.ov_event_file);
++        fprintf(g.ov_event_file, "step,layer,early_n,has_cold,submit_ms,cold_done_ms,early_start_ms,early_end_ms,early_cpu_ms,achieved_ms,idle_wait_ms,finished_before_io,outstanding_at_io,duplicated_cpu_proxy_ms\n");
++    }
+     g.stats_path = getenv_str("LLAMA_MOE_PAGING_STATS", "results/moe_paging_stats.json");
+     g.stats_interval = getenv_int("LLAMA_MOE_PAGING_STATS_INTERVAL", 128);
+     g.fault_after = getenv_int("LLAMA_MOE_PAGING_FAULT_AFTER", 0);
+@@ -3359,6 +3479,30 @@
+     }
+ }
+ 
++// Same production swiglu for cold columns, exact cached activation for ready columns.
++void llama_moe_paging_swiglu(ggml_tensor * dst, const ggml_tensor * gate, const ggml_tensor * up,
++                             int ith, int nth, void * userdata) {
++    auto * l = (llama_moe_paging_layer *) userdata;
++    GGML_ASSERT(gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && gate->ne[2] == 1);
++    const int n = gate->ne[0];
++    for (int j = ith; j < gate->ne[1]; j += nth) {
++        float * out = (float *) ((char *) dst->data + j * dst->nb[1]);
++        if (l->early_ready[j] && !g.overlap_verify) {
++            memcpy(out, l->early_act.data() + (size_t) j * n, n * sizeof(float));
++        } else {
++            ggml_vec_swiglu_f32(n, out, (const float *) ((const char *) gate->data + j * gate->nb[1]),
++                                       (const float *) ((const char *) up->data + j * up->nb[1]));
++        }
++    }
++}
++
++// Explicit input dependency: slot resolution cannot observe a stale MoE input.
++void llama_moe_paging_slots_input(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * input,
++                                  int ith, int nth, void * userdata) {
++    if (ith == 0) { ((llama_moe_paging_layer *) userdata)->early_in = input; }
++    llama_moe_paging_slots(dst, a, ith, nth, userdata);
++}
++
+ // Return the paging layer that owns this resident-slot tensor, or nullptr.
+ static llama_moe_paging_layer * direct_layer_for(const ggml_tensor * src0) {
+     if (!g.enabled || g.compute_mode != "direct_sparse") {
+@@ -3461,6 +3605,7 @@
+         // ne12 == ids->ne[1] == 1, so only the single token plane is converted.
+         // Threads split the rows; ggml's workspace layout is i11*row_size.
+         for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
++            if (g.overlap_enabled && !g.overlap_verify && proj == 2 && l->early_ready[i11]) { continue; }
+             GGML_ASSERT(i11 >= 0);
+             from_float((const float *) ((const char *) src1->data + (size_t) i11 * nb11),
+                        wbuf + (size_t) i11 * nbw1,
+@@ -3488,10 +3633,11 @@
+ 
+     // Execution 017: keep the exact kernel loop in a lambda so the same path can
+     // be timed and replayed for n = 1..n_ids selected experts.
++    const bool skip_early = g.overlap_enabled && !g.overlap_verify;
+     auto run_selected = [&](int n_sel) {
+         for (int jj = 0; jj < n_sel; jj++) {
+             const int j = order[jj];
+-            if (g.ov_skip && l->early_ready[j]) { continue; }
++            if (skip_early && l->early_ready[j]) { continue; }
+             const int32_t s = sel[j];
+             const char * src0_cur = (const char *) src0->data + (size_t) s * nb02;
+             const int64_t i11 = (int64_t) j % ne11;
+@@ -3547,9 +3693,7 @@
+ 
+     const double op_t0 = (g.timeline && ith == 0) ? now_ms() : 0.0;
+ 
+-    g.ov_skip = g.overlap_enabled && !g.overlap_verify;
+     run_selected(n_ids);
+-    g.ov_skip = false;
+ 
+     if (g.timeline) {
+         ggml_barrier(params->threadpool);
+@@ -3649,14 +3793,15 @@
+ 
+     // Execution 017 Part D: inject the early-computed ready experts; in verify mode
+     // diff them byte-for-byte against the canonical direct_sparse down result.
+-    if (g.overlap_enabled && proj == 2) {
++    if (g.overlap_enabled) {
+         ggml_barrier(params->threadpool);
+         if (ith == 0) {
+-            const int n_emb = (int) l->slot_down->ne[1];
++            const int n_emb = (int) (proj == 2 ? l->slot_down->ne[1] : l->slot_gate->ne[1]);
+             for (int j = 0; j < n_ids; j++) {
+                 if (!l->early_ready[j]) { continue; }
+                 float * dcol = (float *) ((char *) dst->data + (size_t) j * nb1);
+-                const float * e = l->early_out.data() + (size_t) j * (size_t) n_emb;
++                const auto & buf = proj == 0 ? l->early_gate : proj == 1 ? l->early_up : l->early_out;
++                const float * e = buf.data() + (size_t) j * (size_t) n_emb;
+                 if (g.overlap_verify) {
+                     int mism = 0;
+                     for (int r = 0; r < n_emb; r++) {
+@@ -3665,7 +3810,8 @@
+                     if (mism > 0) {
+                         g.ov_verify_fail++;
+                         fprintf(stderr, "MOE_OVERLAP_VERIFY layer=%d j=%d slot=%d mismatches=%d\n",
+-                                l->il, j, sel[order[j]], mism);
++                                l->il, j, sel[j], mism);
++                        GGML_ABORT("early compute differential mismatch; stopping immediately");
+                     } else {
+                         g.ov_verify_pass++;
+                     }
+diff --git a/src/llama-moe-paging.h b/src/llama-moe-paging.h
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -164,7 +164,8 @@
+     ggml_tensor * tl_down_out = nullptr;
+     // Execution 017 Part D: early resident compute overlap
+     const ggml_tensor * early_in = nullptr;
+-    std::vector<float>   early_out;
++    std::vector<float>   early_out, early_gate, early_up, early_act;
++    double early_start[8] = {}, early_act_start[8] = {}, early_act_end[8] = {}, early_end[8] = {};
+     bool                 early_ready[8] = {};
+     int                  early_n = 0;
+ };
+@@ -242,6 +243,10 @@
+ // Execution 017 Part D: prototype overlap of ready resident-expert compute with the
+ // authoritative cold reads. Disabled unless LLAMA_MOE_PAGING_OVERLAP=1.
+ bool llama_moe_paging_overlap_enabled();
++void llama_moe_paging_swiglu(ggml_tensor * dst, const ggml_tensor * gate, const ggml_tensor * up,
++                             int ith, int nth, void * userdata);
++void llama_moe_paging_slots_input(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * input,
++                                  int ith, int nth, void * userdata);
+ void llama_moe_paging_early_input(ggml_tensor * dst, const ggml_tensor * a,
+                                   int ith, int nth, void * userdata);
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2154,15 +2154,17 @@
+     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+     cb(weights, "ffn_moe_weights", il);
+ 
+-    if (moe_page != nullptr && llama_moe_paging_overlap_enabled()) {
+-        // Execution 017 Part D: cache the MoE input for the early ready-expert compute
+-        cur = ggml_map_custom1_inplace(ctx0, cur, llama_moe_paging_early_input, 1, moe_page);
+-    }
+-
+     if (moe_page != nullptr) {
+         if (llama_moe_paging_direct_mode()) {
+             // page the selected experts into resident slots and remap ids to slots
+-            selected_experts = ggml_map_custom1(ctx0, selected_experts, llama_moe_paging_slots, 1, moe_page);
++            if (llama_moe_paging_overlap_enabled()) {
++                GGML_ASSERT(!weight_before_ffn && type_op == LLM_FFN_SILU && !gate_up_exps &&
++                            !gate_exps_b && !up_exps_b && !down_exps_b && !gate_exps_s && !up_exps_s && !down_exps_s);
++                GGML_ASSERT(il >= 0 && hparams.swiglu_clamp_exp[il] <= 1e-6f);
++                selected_experts = ggml_map_custom2(ctx0, selected_experts, cur, llama_moe_paging_slots_input, 1, moe_page);
++            } else {
++                selected_experts = ggml_map_custom1(ctx0, selected_experts, llama_moe_paging_slots, 1, moe_page);
++            }
+             cb(selected_experts, "ffn_moe_topk_slot", il);
+         } else {
+             // page the K selected experts into the K-slot staging tensors and remap ids
+@@ -2291,7 +2293,11 @@
+             }
+ 
+             if (has_gate) {
+-                cur = ggml_swiglu_split(ctx0, cur, up);
++                if (moe_page && llama_moe_paging_overlap_enabled()) {
++                    cur = ggml_map_custom2(ctx0, cur, up, llama_moe_paging_swiglu, GGML_N_TASKS_MAX, moe_page);
++                } else {
++                    cur = ggml_swiglu_split(ctx0, cur, up);
++                }
+                 cb(cur, "ffn_moe_swiglu", il);
+             } else {
+                 cur = ggml_silu(ctx0, cur);
