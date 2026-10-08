@@ -6,7 +6,7 @@ Experimental, **exact-with-respect-to-the-specified GGUF** inference using on-de
 
 > **Status:** research prototype; Apple M1 result reproduced in 64 fresh 600-token timing processes across 16 configurations. This is **not** a claim of a universal speedup over stock llama.cpp or of BF16-model equivalence.
 >
-> **Build status:** public source reconstruction and CI are being prepared. The validated historical [rc14 binary](https://github.com/eugenetolok/moe-prefetch-poc/releases/tag/m1-rc14-combinations) is in a separate private research repository and is *not yet independently reproduced by this public CI*. Do not treat new CI artifacts as byte-identical to the benchmarked rc14 binary until the source-provenance gate passes.
+> **Build status:** public source reconstruction and CI are being prepared. The historical rc14 binary was produced from a separate private research checkout; its measurements and hashes are documented here, but **there is not yet a public release binary**. Public CI builds must independently pass the [source-provenance and release gates](docs/build.md) before we claim that they reproduce rc14. Do not treat new CI artifacts as byte-identical to the benchmarked rc14 binary until the source-provenance gate passes.
 
 ## Measured result
 
