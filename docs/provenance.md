@@ -13,9 +13,11 @@ The historical reviewed release source commit was `0a1e4616954dea4ec2cd68f7f8a06
 
 ## Licensing
 
-`llama.cpp` is a separately maintained project with its own license and third-party notices. Preserving relevant upstream notices is required when redistributing derived runtime binaries. The author must select and publish an explicit license for the project-specific modifications; **publicly visible source is not automatically OSI-licensed**. Until an owner-approved license and dependency notices are added, third-party redistribution rights should not be assumed.
+Project-specific code in this repository is released under the MIT License; see [LICENSE](../LICENSE).
 
-The GGUF's weights and the model's licenses are independent of this code and are **not included**.
+`llama.cpp` is separately maintained and also uses the MIT License. Preserving the exact upstream copyright and license notice from the pinned source tree is required when redistributing a derived runtime binary. Public release packages copy that pinned tree's `LICENSE` as `UPSTREAM-LLAMA-LICENSE`; see [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
+The GGUF weights and model licenses are independent of this code and are **not included**.
 
 ## Accuracy and publication policy
 
