@@ -1,0 +1,1036 @@
+diff --git a/src/llama-moe-paging.h b/src/llama-moe-paging.h
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -130,6 +130,22 @@
+     bool    oracle_is_miss[8] = {};
+     double  oracle_submit_ms = 0.0;
+     double  oracle_layer_start_ms = 0.0;
++
++    // Execution 015 protected probation slots. slot_state: 0 EMPTY, 1 DEMAND,
++    // 2 PREFETCH_LOADING, 3 PREFETCH_READY. Physical slots M+P; exactly M are
++    // logical DEMAND while the cache is warm.
++    std::vector<uint8_t>  slot_state;
++    std::vector<double>   pf_submit_ms;   // per-slot prefetch submit clock
++    int                   demand_count = 0;
++    // independent demand-only LRU model used to assert logical cache identity
++    std::vector<int32_t>  shadow_expert;
++    std::vector<uint64_t> shadow_last_use;
++    int                   shadow_n = 0;
++    // a0_shadow: the candidate set chosen at the layer-start A0 event
++    int32_t               pf_cand[32] = {};
++    int                   pf_cand_n = 0;
++    // predictor placement lead: A0-ready -> authoritative demand
++    double                a0_ready_ms = 0.0;
+ };
+ 
+ // Idempotent. Reads the env vars:
+@@ -189,6 +205,25 @@
+ void llama_moe_paging_oracle_a0_barrier(ggml_tensor * dst, const ggml_tensor * a,
+                                         const ggml_tensor * b, int ith, int nth, void * userdata);
+ 
++// Execution 015 protected probation prefetch. Modes: off | a0 | a0_shadow | oracle.
++// a0/a0_shadow insert the pre-attention A0 branch and select Top-P nonresident
++// candidates; oracle replays the captured route trace. Speculative reads never
++// evict logical DEMAND state.
++bool llama_moe_paging_prefetch_a0_mode();
++bool llama_moe_paging_prefetch_oracle_mode();
++int  llama_moe_paging_prefetch_pool();
++
++// Start marker: stamps the layer-start time and passes the layer input through.
++void llama_moe_paging_prefetch_start(ggml_tensor * dst, const ggml_tensor * a,
++                                     int ith, int nth, void * userdata);
++// Consumes the A0 Top-k indices and submits (or, in a0_shadow, records) the
++// selected nonresident candidates. Returns the layer input unchanged.
++void llama_moe_paging_prefetch_a0(ggml_tensor * dst, const ggml_tensor * a,
++                                  const ggml_tensor * b, int ith, int nth, void * userdata);
++// Oracle mode: starts the P probation reads for this layer event from the trace.
++void llama_moe_paging_prefetch_oracle(ggml_tensor * dst, const ggml_tensor * a,
++                                      int ith, int nth, void * userdata);
++
+ // Execution 009: resolve the global expert ids in `a` to resident slot ids and
+ // page any missing expert directly into its final resident slot. Writes ascending
+ // resident-slot ids to dst. Registered as a ggml custom op.
+diff --git a/src/llama-moe-paging.cpp b/src/llama-moe-paging.cpp
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -96,6 +96,18 @@
+     int64_t offset = 0;
+     size_t  size = 0;
+ };
++
++// Execution 015: one in-flight speculative read set for one layer event.
++struct prefetch_batch {
++    std::unique_ptr<read_pending> p;
++    std::vector<int32_t> slots;
++};
++
++// slot_state values
++constexpr uint8_t ST_EMPTY   = 0;
++constexpr uint8_t ST_DEMAND  = 1;
++constexpr uint8_t ST_LOADING = 2;
++constexpr uint8_t ST_READY   = 3;
+ 
+ struct paging_state {
+     bool enabled = false;
+@@ -178,10 +190,48 @@
+     uint64_t victim_plan_mismatches = 0;
+     uint64_t duplicate_reads = 0;
+ 
+-    // worker pool
++    // Execution 015 protected probation prefetch
++    bool         prefetch_enabled = false;
++    int          prefetch_p = 0;          // probation capacity P
++    int          prefetch_pool = 16;      // A0 Top-K pool size
++    int          demand_slots = 0;        // logical M
++    std::string  prefetch_mode = "off";   // off | a0 | a0_shadow | oracle
++    bool         shadow_assert = false;
++    uint64_t pf_candidates = 0;
++    uint64_t pf_submitted_experts = 0;
++    uint64_t pf_submitted_bytes = 0;
++    uint64_t pf_skipped_demand = 0;
++    uint64_t pf_skipped_existing = 0;
++    uint64_t pf_skipped_busy = 0;
++    uint64_t pf_ready_useful = 0;
++    uint64_t pf_join_useful = 0;
++    uint64_t pf_wasted = 0;
++    uint64_t pf_promotions = 0;
++    uint64_t pf_evicted_unused = 0;
++    uint64_t pf_failed = 0;
++    uint64_t logical_hits = 0;
++    uint64_t logical_misses = 0;
++    uint64_t demand_read_bytes = 0;
++    uint64_t prefetch_read_bytes = 0;
++    uint64_t pf_shadow_useful = 0;
++    uint64_t pf_shadow_misses = 0;
++    uint64_t pf_shadow_cand = 0;
++    double   demand_wait_ms_total = 0.0;
++    double   demand_wait_unrelated_ms = 0.0;
++    uint64_t shadow_checks = 0;
++    uint64_t shadow_fail = 0;
++    uint64_t pf_occupancy_sum = 0;
++    uint64_t demand_occupancy_sum = 0;
++    uint64_t occupancy_samples = 0;
++    std::vector<double> pf_lead_us;
++    std::vector<double> a0_lead_us;
++    std::vector<std::vector<prefetch_batch>> pf_batches;
++
++    // worker pool. High-priority (demand) tasks are always drained first.
+     std::mutex mtx;
+     std::condition_variable cv_task;
+-    std::deque<io_task> queue;
++    std::deque<io_task> queue_hi;
++    std::deque<io_task> queue_lo;
+     bool stopping = false;
+     std::vector<std::thread> workers;
+ };
+@@ -275,15 +325,21 @@
+         io_task t;
+         {
+             std::unique_lock<std::mutex> lk(g.mtx);
+-            g.cv_task.wait(lk, [] { return g.stopping || !g.queue.empty(); });
+-            if (g.queue.empty()) {
++            g.cv_task.wait(lk, [] { return g.stopping || !g.queue_hi.empty() || !g.queue_lo.empty(); });
++            if (g.queue_hi.empty() && g.queue_lo.empty()) {
+                 if (g.stopping) {
+                     return;
+                 }
+                 continue;
+             }
+-            t = g.queue.front();
+-            g.queue.pop_front();
++            // demand (high priority) always before speculation (low priority)
++            if (!g.queue_hi.empty()) {
++                t = g.queue_hi.front();
++                g.queue_hi.pop_front();
++            } else {
++                t = g.queue_lo.front();
++                g.queue_lo.pop_front();
++            }
+         }
+         run_one_task(t);
+     }
+@@ -314,7 +370,7 @@
+         for (const auto & t : tasks) {
+             io_task copy = t;
+             copy.batch = &batch;
+-            g.queue.push_back(copy);
++            g.queue_hi.push_back(copy);
+         }
+     }
+     g.cv_task.notify_all();
+@@ -327,7 +383,7 @@
+ 
+ // Async read submission for overlap/persistent modes. The caller must keep `p`
+ // alive until wait_read_tasks returns. QD1 stays synchronous (nothing to overlap).
+-void submit_read_tasks(const std::vector<io_task> & tasks, read_pending & p) {
++void submit_read_tasks(const std::vector<io_task> & tasks, read_pending & p, bool high = true) {
+     p.submitted = true;
+     p.ok = true;
+     if (tasks.empty()) {
+@@ -348,14 +404,32 @@
+     p.batch.failed.store(false);
+     {
+         std::lock_guard<std::mutex> lk(g.mtx);
++        auto & q = high ? g.queue_hi : g.queue_lo;
+         for (const auto & t : tasks) {
+             io_task copy = t;
+             copy.batch = &p.batch;
+-            g.queue.push_back(copy);
++            q.push_back(copy);
+         }
+     }
+     g.cv_task.notify_all();
+     p.async = true;
++}
++
++// Execution 015: move not-yet-started speculative component tasks for one expert
++// to the high-priority queue when authoritative demand joins that expert.
++void promote_prefetch_tasks(llama_moe_paging_layer & l, int32_t gid) {
++    if (g.workers.empty()) {
++        return;
++    }
++    std::lock_guard<std::mutex> lk(g.mtx);
++    for (auto it = g.queue_lo.begin(); it != g.queue_lo.end(); ) {
++        if (it->layer == &l && it->gid == gid) {
++            g.queue_hi.push_back(*it);
++            it = g.queue_lo.erase(it);
++        } else {
++            ++it;
++        }
++    }
+ }
+ 
+ bool wait_read_tasks(read_pending & p) {
+@@ -471,6 +545,31 @@
+         double idx = q * (double) (a0_sorted.size() - 1);
+         return a0_sorted[(size_t) idx];
+     };
++
++    std::vector<double> pfl_sorted = g.pf_lead_us;
++    std::sort(pfl_sorted.begin(), pfl_sorted.end());
++    auto pfl_pct = [&](double q) -> double {
++        if (pfl_sorted.empty()) {
++            return 0.0;
++        }
++        double idx = q * (double) (pfl_sorted.size() - 1);
++        return pfl_sorted[(size_t) idx];
++    };
++    std::vector<double> a0l_sorted = g.a0_lead_us;
++    std::sort(a0l_sorted.begin(), a0l_sorted.end());
++    auto a0l_pct = [&](double q) -> double {
++        if (a0l_sorted.empty()) {
++            return 0.0;
++        }
++        double idx = q * (double) (a0l_sorted.size() - 1);
++        return a0l_sorted[(size_t) idx];
++    };
++    const uint64_t total_read_bytes = g.demand_read_bytes + g.prefetch_read_bytes;
++    const double total_bytes_ratio = g.demand_read_bytes > 0
++        ? (double) total_read_bytes / (double) g.demand_read_bytes : 0.0;
++    const double mean_occupancy = g.occupancy_samples > 0
++        ? (double) g.pf_occupancy_sum / (double) g.occupancy_samples : 0.0;
++
+     fprintf(f, "{\n");
+     fprintf(f, " \"mode\": \"cpu_hybrid_staging_paging\",\n");
+     fprintf(f, " \"backend\": \"%s\",\n", g.backend.c_str());
+@@ -512,6 +611,43 @@
+     fprintf(f, " \"victim_plan_matches\": %llu,\n", (unsigned long long) g.victim_plan_matches);
+     fprintf(f, " \"victim_plan_mismatches\": %llu,\n", (unsigned long long) g.victim_plan_mismatches);
+     fprintf(f, " \"duplicate_reads\": %llu,\n", (unsigned long long) g.duplicate_reads);
++    fprintf(f, " \"prefetch_enabled\": %s,\n", g.prefetch_enabled ? "true" : "false");
++    fprintf(f, " \"prefetch_mode\": \"%s\",\n", g.prefetch_mode.c_str());
++    fprintf(f, " \"prefetch_p\": %d,\n", g.prefetch_p);
++    fprintf(f, " \"prefetch_pool\": %d,\n", g.prefetch_pool);
++    fprintf(f, " \"demand_slots\": %d,\n", g.demand_slots);
++    fprintf(f, " \"probation_slots\": %d,\n", g.prefetch_enabled ? g.prefetch_p : 0);
++    fprintf(f, " \"physical_slots\": %d,\n", g.m_slots);
++    fprintf(f, " \"prefetch_candidates\": %llu,\n", (unsigned long long) g.pf_candidates);
++    fprintf(f, " \"prefetch_submitted_experts\": %llu,\n", (unsigned long long) g.pf_submitted_experts);
++    fprintf(f, " \"prefetch_submitted_bytes\": %llu,\n", (unsigned long long) g.pf_submitted_bytes);
++    fprintf(f, " \"prefetch_skipped_demand_resident\": %llu,\n", (unsigned long long) g.pf_skipped_demand);
++    fprintf(f, " \"prefetch_skipped_existing\": %llu,\n", (unsigned long long) g.pf_skipped_existing);
++    fprintf(f, " \"prefetch_skipped_busy\": %llu,\n", (unsigned long long) g.pf_skipped_busy);
++    fprintf(f, " \"prefetch_ready_useful\": %llu,\n", (unsigned long long) g.pf_ready_useful);
++    fprintf(f, " \"prefetch_join_useful\": %llu,\n", (unsigned long long) g.pf_join_useful);
++    fprintf(f, " \"prefetch_promotions\": %llu,\n", (unsigned long long) g.pf_promotions);
++    fprintf(f, " \"prefetch_wasted\": %llu,\n", (unsigned long long) g.pf_wasted);
++    fprintf(f, " \"prefetch_evicted_unused\": %llu,\n", (unsigned long long) g.pf_evicted_unused);
++    fprintf(f, " \"prefetch_failed\": %llu,\n", (unsigned long long) g.pf_failed);
++    fprintf(f, " \"logical_demand_hits\": %llu,\n", (unsigned long long) g.logical_hits);
++    fprintf(f, " \"logical_demand_misses\": %llu,\n", (unsigned long long) g.logical_misses);
++    fprintf(f, " \"demand_read_bytes\": %llu,\n", (unsigned long long) g.demand_read_bytes);
++    fprintf(f, " \"prefetch_read_bytes\": %llu,\n", (unsigned long long) g.prefetch_read_bytes);
++    fprintf(f, " \"total_read_bytes\": %llu,\n", (unsigned long long) total_read_bytes);
++    fprintf(f, " \"total_bytes_ratio\": %.6f,\n", total_bytes_ratio);
++    fprintf(f, " \"prefetch_shadow_useful\": %llu,\n", (unsigned long long) g.pf_shadow_useful);
++    fprintf(f, " \"prefetch_shadow_misses\": %llu,\n", (unsigned long long) g.pf_shadow_misses);
++    fprintf(f, " \"prefetch_shadow_candidates\": %llu,\n", (unsigned long long) g.pf_shadow_cand);
++    fprintf(f, " \"demand_wait_ms\": %.3f,\n", g.demand_wait_ms_total);
++    fprintf(f, " \"demand_wait_on_unrelated_prefetch_ms\": %.3f,\n", g.demand_wait_unrelated_ms);
++    fprintf(f, " \"prefetch_lead_us_p50\": %.3f,\n", pfl_pct(0.50));
++    fprintf(f, " \"prefetch_lead_us_p95\": %.3f,\n", pfl_pct(0.95));
++    fprintf(f, " \"predictor_lead_us_p50\": %.3f,\n", a0l_pct(0.50));
++    fprintf(f, " \"predictor_lead_us_p95\": %.3f,\n", a0l_pct(0.95));
++    fprintf(f, " \"prefetch_occupancy_mean\": %.3f,\n", mean_occupancy);
++    fprintf(f, " \"shadow_checks\": %llu,\n", (unsigned long long) g.shadow_checks);
++    fprintf(f, " \"shadow_fail\": %llu,\n", (unsigned long long) g.shadow_fail);
+     fprintf(f, " \"hot_fill_semantics\": \"%s\",\n",
+             g.hot ? "synthetic_single_record" : "exact_model_bytes");
+     fprintf(f, " \"hits\": %llu,\n", (unsigned long long) hits);
+@@ -764,6 +900,575 @@
+     *n_miss_out = n_miss;
+ }
+ 
++// --- Execution 015 protected probation ---------------------------------------
++// Speculative prefetch never evicts a logical DEMAND slot; the demand-only M-slot
++// LRU evolves exactly as if prefetch did not exist.
++
++int find_slot_state(const llama_moe_paging_layer & l, int32_t gid, uint8_t st) {
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_state[s] == st && l.slot_expert[s] == gid) {
++            return s;
++        }
++    }
++    return -1;
++}
++
++int find_empty_slot(const llama_moe_paging_layer & l) {
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_state[s] == ST_EMPTY) {
++            return s;
++        }
++    }
++    return -1;
++}
++
++int find_empty_slot_ex(const llama_moe_paging_layer & l, const uint8_t * reserved) {
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_state[s] == ST_EMPTY && !reserved[s]) {
++            return s;
++        }
++    }
++    return -1;
++}
++
++// Demand-only LRU victim among DEMAND slots not reserved by this event.
++int pick_demand_victim(const llama_moe_paging_layer & l, const uint8_t * reserved) {
++    int slot = -1;
++    const bool decay = g.policy == "event_decay90";
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_state[s] != ST_DEMAND || reserved[s]) {
++            continue;
++        }
++        if (slot < 0) {
++            slot = s;
++            continue;
++        }
++        const bool better = decay ? (l.score[s] < l.score[slot]) : (l.last_use[s] < l.last_use[slot]);
++        if (better) {
++            slot = s;
++        }
++    }
++    return slot;
++}
++
++void prefetch_close_batch(llama_moe_paging_layer & l, std::vector<prefetch_batch>::iterator it) {
++    const bool ok = it->p->submitted ? it->p->ok : true;
++    for (const int32_t s : it->slots) {
++        if (l.slot_state[s] != ST_LOADING) {
++            continue;
++        }
++        if (ok) {
++            l.slot_state[s] = ST_READY;
++        } else {
++            l.slot_state[s] = ST_EMPTY;
++            l.slot_expert[s] = -1;
++            l.last_use[s] = 0;
++            g.pf_failed++;
++        }
++    }
++    g.pf_batches[l.il].erase(it);
++}
++
++// Drop completed prefetch batches. Does not wait.
++void prefetch_finalize(llama_moe_paging_layer & l) {
++    auto & bs = g.pf_batches[l.il];
++    for (auto it = bs.begin(); it != bs.end(); ) {
++        const bool done = it->p->submitted && (!it->p->async || it->p->batch.remaining.load() == 0);
++        if (!done) {
++            ++it;
++            continue;
++        }
++        if (it->p->async) {
++            it->p->ok = !it->p->batch.failed.load();
++        }
++        prefetch_close_batch(l, it);
++    }
++}
++
++// Authoritative demand joins the in-flight speculative batch that owns slot.
++void prefetch_join(llama_moe_paging_layer & l, int32_t slot) {
++    auto & bs = g.pf_batches[l.il];
++    for (auto it = bs.begin(); it != bs.end(); ++it) {
++        bool has = false;
++        for (const int32_t s : it->slots) {
++            if (s == slot) {
++                has = true;
++                break;
++            }
++        }
++        if (!has) {
++            continue;
++        }
++        wait_read_tasks(*it->p);
++        if (it->p->async) {
++            it->p->ok = !it->p->batch.failed.load();
++        }
++        prefetch_close_batch(l, it);
++        return;
++    }
++}
++
++// Choose up to P nonresident, non-existing experts from the sorted A0 pool.
++int prefetch_select(llama_moe_paging_layer & l, const int32_t * pool, int npool, int32_t * out) {
++    int n = 0;
++    for (int i = 0; i < npool && n < g.prefetch_p; i++) {
++        const int32_t e = pool[i];
++        g.pf_candidates++;
++        if (e < 0 || e >= g.n_expert) {
++            continue;
++        }
++        if (find_slot_state(l, e, ST_DEMAND) >= 0) {
++            g.pf_skipped_demand++;
++            continue;
++        }
++        if (find_slot_state(l, e, ST_READY) >= 0 || find_slot_state(l, e, ST_LOADING) >= 0) {
++            g.pf_skipped_existing++;
++            continue;
++        }
++        out[n++] = e;
++    }
++    return n;
++}
++
++// Submit the selected candidates as one low-priority batch. At most one batch per
++// layer is outstanding, so join bookkeeping stays unambiguous.
++void prefetch_submit(llama_moe_paging_layer & l, const int32_t * cand, int n) {
++    if (n <= 0) {
++        return;
++    }
++    if (!g.pf_batches[l.il].empty()) {
++        g.pf_skipped_busy += (uint64_t) n;
++        return;
++    }
++    std::vector<io_task> tasks;
++    std::vector<int32_t> slots;
++    for (int i = 0; i < n; i++) {
++        const int s = find_empty_slot(l);
++        if (s < 0) {
++            g.pf_skipped_busy++;
++            continue;
++        }
++        l.slot_expert[s] = cand[i];
++        l.slot_state[s] = ST_LOADING;
++        l.pf_submit_ms[s] = now_ms();
++        build_read_tasks(l, cand[i], s, tasks);
++        slots.push_back(s);
++        g.pf_submitted_experts++;
++    }
++    if (tasks.empty()) {
++        return;
++    }
++    auto p = std::make_unique<read_pending>();
++    submit_read_tasks(tasks, *p, /*high=*/false);
++    size_t bytes = 0;
++    for (const auto & t : tasks) {
++        bytes += t.size;
++    }
++    g.pf_submitted_bytes += (uint64_t) bytes;
++    g.prefetch_read_bytes += (uint64_t) slots.size() * (uint64_t) g.record_stride;
++    prefetch_batch pb;
++    pb.p = std::move(p);
++    pb.slots = std::move(slots);
++    g.pf_batches[l.il].push_back(std::move(pb));
++}
++
++// Layer-start A0 event: drop stale READY entries, then record or submit Top-P.
++void prefetch_event(llama_moe_paging_layer & l, const int32_t * pool, int npool) {
++    prefetch_finalize(l);
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_state[s] == ST_READY) {
++            l.slot_state[s] = ST_EMPTY;
++            l.slot_expert[s] = -1;
++            l.last_use[s] = 0;
++            g.pf_wasted++;
++            g.pf_evicted_unused++;
++        }
++    }
++    int32_t cand[MAX_K];
++    const int n = prefetch_select(l, pool, npool, cand);
++    if (g.prefetch_mode == "a0_shadow") {
++        l.pf_cand_n = n;
++        for (int i = 0; i < n; i++) {
++            l.pf_cand[i] = cand[i];
++        }
++        g.pf_shadow_cand += (uint64_t) n;
++        return;
++    }
++    prefetch_submit(l, cand, n);
++}
++
++// Independent demand-only M-slot LRU over expert ids, used to assert that the
++// physical DEMAND set stayed identical to demand-only.
++int shadow_step(llama_moe_paging_layer & l, const int32_t * req, int k, bool * is_miss) {
++    const int M = g.demand_slots;
++    std::vector<uint8_t> reserved((size_t) M, 0);
++    int n_miss = 0;
++    for (int i = 0; i < k; i++) {
++        const int idx = [&] {
++            for (int j = 0; j < l.shadow_n; j++) {
++                if (l.shadow_expert[j] == req[i]) {
++                    return j;
++                }
++            }
++            return -1;
++        }();
++        if (idx >= 0) {
++            is_miss[i] = false;
++            reserved[idx] = 1;
++        } else {
++            is_miss[i] = true;
++            n_miss++;
++        }
++    }
++    // hits refresh first, then admissions, mirroring the demand-only clock order
++    for (int i = 0; i < k; i++) {
++        if (is_miss[i]) {
++            continue;
++        }
++        for (int j = 0; j < l.shadow_n; j++) {
++            if (l.shadow_expert[j] == req[i]) {
++                l.shadow_last_use[j] = ++g.clock;
++                break;
++            }
++        }
++    }
++    for (int i = 0; i < k; i++) {
++        if (!is_miss[i]) {
++            continue;
++        }
++        int victim = -1;
++        if (l.shadow_n < M) {
++            victim = l.shadow_n++;
++        } else {
++            for (int j = 0; j < l.shadow_n; j++) {
++                if (reserved[j]) {
++                    continue;
++                }
++                if (victim < 0 || l.shadow_last_use[j] < l.shadow_last_use[victim]) {
++                    victim = j;
++                }
++            }
++        }
++        if (victim < 0) {
++            GGML_ABORT("moe paging shadow: no victim (M=%d misses=%d)", M, n_miss);
++        }
++        reserved[victim] = 1;
++        l.shadow_expert[victim] = req[i];
++        l.shadow_last_use[victim] = ++g.clock;
++    }
++    return n_miss;
++}
++
++void shadow_check(const llama_moe_paging_layer & l) {
++    int n = 0;
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_state[s] != ST_DEMAND) {
++            continue;
++        }
++        n++;
++        bool found = false;
++        for (int j = 0; j < l.shadow_n; j++) {
++            if (l.shadow_expert[j] == l.slot_expert[s]) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) {
++            g.shadow_fail++;
++            GGML_ABORT("moe paging shadow: physical DEMAND expert %d not in demand-only set (layer %d)",
++                       l.slot_expert[s], l.il);
++        }
++    }
++    if (n != l.shadow_n) {
++        g.shadow_fail++;
++        GGML_ABORT("moe paging shadow: %d physical DEMAND slots != shadow %d (layer %d)",
++                   n, l.shadow_n, l.il);
++    }
++    for (int j = 0; j < l.shadow_n; j++) {
++        if (find_slot_state(l, l.shadow_expert[j], ST_DEMAND) < 0) {
++            g.shadow_fail++;
++            GGML_ABORT("moe paging shadow: demand-only expert %d missing from physical DEMAND (layer %d)",
++                       l.shadow_expert[j], l.il);
++        }
++    }
++    g.shadow_checks++;
++}
++
++// Authoritative demand event under protected probation.
++void stage_event_prefetch(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
++    const double demand_t0 = now_ms();
++    // any completed speculative batch is READY before the router request is served
++    prefetch_finalize(l);
++    if (l.a0_ready_ms > 0.0) {
++        g.a0_lead_us.push_back((demand_t0 - l.a0_ready_ms) * 1000.0);
++        l.a0_ready_ms = 0.0;
++    }
++    const bool decay = g.policy == "event_decay90";
++    if (decay) {
++        for (int s = 0; s < l.n_slots; s++) {
++            l.score[s] *= 0.90;
++        }
++    }
++
++    int  hit_slot[MAX_K];
++    int  pf_slot[MAX_K];
++    bool is_demand[MAX_K];
++    bool pf_was_loading[MAX_K];
++    for (int i = 0; i < k; i++) {
++        hit_slot[i] = find_slot_state(l, req[i], ST_DEMAND);
++        is_demand[i] = hit_slot[i] >= 0;
++        pf_slot[i] = -1;
++        pf_was_loading[i] = false;
++        if (!is_demand[i]) {
++            pf_slot[i] = find_slot_state(l, req[i], ST_READY);
++            if (pf_slot[i] < 0) {
++                pf_slot[i] = find_slot_state(l, req[i], ST_LOADING);
++                pf_was_loading[i] = pf_slot[i] >= 0;
++            }
++        }
++    }
++
++    // a0_shadow evidence: candidates the native router then requested
++    if (g.prefetch_mode == "a0_shadow" && l.pf_cand_n > 0) {
++        for (int j = 0; j < l.pf_cand_n; j++) {
++            for (int i = 0; i < k; i++) {
++                if (req[i] == l.pf_cand[j]) {
++                    g.pf_shadow_useful++;
++                    break;
++                }
++            }
++        }
++    }
++
++    // reserve this event's demand hits so no victim evicts them
++    std::vector<uint8_t> dres((size_t) l.n_slots, 0);
++    for (int i = 0; i < k; i++) {
++        if (is_demand[i]) {
++            dres[hit_slot[i]] = 1;
++        }
++    }
++
++    // logical M-slot admission plan; identical to demand-only. An empty slot is
++    // used only while the logical set is below M; extra misses evict the LRU.
++    const int M = g.demand_slots;
++    int running_demand = l.demand_count;
++    int victim[MAX_K];
++    for (int i = 0; i < k; i++) {
++        if (is_demand[i]) {
++            continue;
++        }
++        int v = -1;
++        if (running_demand < M) {
++            v = find_empty_slot_ex(l, dres.data());
++            if (v >= 0) {
++                running_demand++;
++            }
++        }
++        if (v < 0) {
++            v = pick_demand_victim(l, dres.data());
++        }
++        if (v < 0) {
++            GGML_ABORT("moe paging prefetch: no demand victim (M=%d misses=%d)", M, k);
++        }
++        dres[v] = 1;
++        victim[i] = v;
++    }
++
++    // ordinary demand reads for experts not served by probation
++    std::vector<io_task> tasks;
++    for (int i = 0; i < k; i++) {
++        if (is_demand[i] || pf_slot[i] >= 0) {
++            continue;
++        }
++        build_read_tasks(l, req[i], victim[i], tasks);
++    }
++
++    const double wait0 = now_ms();
++    read_pending rp;
++    if (!tasks.empty()) {
++        submit_read_tasks(tasks, rp, /*high=*/true);
++    }
++    // promote not-yet-started speculative components, then join the same batch
++    for (int i = 0; i < k; i++) {
++        if (pf_was_loading[i]) {
++            promote_prefetch_tasks(l, req[i]);
++        }
++    }
++    double unrelated = 0.0;
++    for (int i = 0; i < k; i++) {
++        if (!pf_was_loading[i]) {
++            continue;
++        }
++        const double j0 = now_ms();
++        prefetch_join(l, pf_slot[i]);
++        unrelated += now_ms() - j0;
++        if (l.slot_state[pf_slot[i]] != ST_READY) {
++            // fail closed: a speculative read error that became authoritative
++            GGML_ABORT("moe paging prefetch: speculative read failed and became demand (layer %d expert %d)",
++                       l.il, req[i]);
++        }
++    }
++    const bool ord_ok = wait_read_tasks(rp);
++    const double wait_dt = now_ms() - wait0;
++    if (!tasks.empty() && !ord_ok) {
++        LLAMA_LOG_ERROR("%s: cannot read the full demand read set (layer %d, %d reads)\n",
++                        __func__, l.il, (int) tasks.size());
++        GGML_ABORT("moe paging: incomplete demand read set; refusing to run with partial weights");
++    }
++    l.read_wait_ms += wait_dt;
++    l.fault_ms += wait_dt;
++    g.demand_wait_ms_total += wait_dt;
++    g.demand_wait_unrelated_ms += unrelated;
++
++    bool shadow_miss[MAX_K] = {};
++    const int n_logical_miss = shadow_step(l, req, k, shadow_miss);
++
++    // commit hits first, then admissions, mirroring the demand-only clock order
++    for (int i = 0; i < k; i++) {
++        if (!is_demand[i]) {
++            continue;
++        }
++        const int s = hit_slot[i];
++        l.last_use[s] = ++g.clock;
++        if (decay) {
++            l.score[s] += 1.0;
++        }
++        l.hits++;
++        g.logical_hits++;
++        out_slot[i] = s;
++    }
++    for (int i = 0; i < k; i++) {
++        if (is_demand[i]) {
++            continue;
++        }
++        const int v = victim[i];
++        if (pf_slot[i] >= 0) {
++            const int ps = pf_slot[i];
++            const double submit_at = l.pf_submit_ms[ps];
++            l.slot_state[ps] = ST_DEMAND;
++            l.slot_expert[ps] = req[i];
++            l.last_use[ps] = ++g.clock;
++            l.score[ps] = decay ? 1.0 : 0.0;
++            l.pf_submit_ms[ps] = 0.0;
++            // logical demand victim becomes EMPTY probation capacity, no weight copy
++            l.slot_state[v] = ST_EMPTY;
++            l.slot_expert[v] = -1;
++            l.last_use[v] = 0;
++            l.score[v] = 0.0;
++            if (l.demand_count < M) {
++                l.demand_count++;
++            }
++            if (submit_at > 0.0) {
++                g.pf_lead_us.push_back((demand_t0 - submit_at) * 1000.0);
++            }
++            if (pf_was_loading[i]) {
++                g.pf_join_useful++;
++            } else {
++                g.pf_ready_useful++;
++            }
++            g.pf_promotions++;
++            out_slot[i] = ps;
++        } else {
++            l.slot_state[v] = ST_DEMAND;
++            l.slot_expert[v] = req[i];
++            l.last_use[v] = ++g.clock;
++            l.score[v] = decay ? 1.0 : 0.0;
++            if (l.demand_count < M) {
++                l.demand_count++;
++            }
++            l.bytes_read += (uint64_t) g.record_stride;
++            g.demand_read_bytes += (uint64_t) g.record_stride;
++            out_slot[i] = v;
++        }
++        l.misses++;
++        g.logical_misses++;
++    }
++    l.miss_hist[std::min(k, 8)]++;
++    l.events++;
++    l.direct_calls++;
++    l.compute_start_ms = now_ms();
++
++    if (g.prefetch_mode == "a0_shadow") {
++        g.pf_shadow_misses += (uint64_t) n_logical_miss;
++    }
++    {
++        uint64_t occ = 0;
++        for (int s = 0; s < l.n_slots; s++) {
++            if (l.slot_state[s] == ST_READY || l.slot_state[s] == ST_LOADING) {
++                occ++;
++            }
++        }
++        g.pf_occupancy_sum += occ;
++        g.demand_occupancy_sum += (uint64_t) l.demand_count;
++        g.occupancy_samples++;
++    }
++    if (g.shadow_assert) {
++        for (int i = 0; i < k; i++) {
++            if (shadow_miss[i] == is_demand[i]) {
++                g.shadow_fail++;
++                GGML_ABORT("moe paging shadow: classification mismatch at layer %d expert %d",
++                           l.il, req[i]);
++            }
++        }
++        shadow_check(l);
++    }
++    if (g.assert_checks) {
++        for (int j = 0; j < k; j++) {
++            const int s = out_slot[j];
++            if (!(s >= 0 && s < l.n_slots)) {
++                GGML_ABORT("moe paging assert: slot %d out of range", s);
++            }
++            if (l.slot_expert[s] != req[j]) {
++                GGML_ABORT("moe paging assert: slot %d holds expert %d, expected %d",
++                           s, l.slot_expert[s], req[j]);
++            }
++            for (int q = 0; q < j; q++) {
++                if (out_slot[q] == s) {
++                    GGML_ABORT("moe paging assert: slot %d assigned twice", s);
++                }
++            }
++        }
++    }
++}
++
++// Oracle probation event: pick up to P actual current-layer demand misses from the
++// captured route trace and push them through the same probation plumbing.
++void prefetch_oracle_event(llama_moe_paging_layer & l) {
++    if (!g.oracle_enabled) {
++        return;
++    }
++    const int64_t ev = (int64_t) g.tokens * (int64_t) g.n_layer + l.il;
++    const int64_t total = (int64_t) g.oracle_n_token * (int64_t) g.n_layer;
++    if (ev < 0 || ev >= total) {
++        GGML_ABORT("moe prefetch oracle: route trace exhausted at token %llu layer %d",
++                   (unsigned long long) g.tokens, l.il);
++    }
++    const int k = g.oracle_k;
++    int32_t req[8];
++    for (int i = 0; i < k; i++) {
++        req[i] = g.oracle_routes[(size_t) ev * (size_t) k + i];
++    }
++    int32_t cand[32];
++    int nc = 0;
++    for (int i = 0; i < k && nc < g.prefetch_p; i++) {
++        if (find_slot_state(l, req[i], ST_DEMAND) >= 0) {
++            continue;
++        }
++        bool dup = false;
++        for (int j = 0; j < nc; j++) {
++            if (cand[j] == req[i]) {
++                dup = true;
++                break;
++            }
++        }
++        if (!dup) {
++            cand[nc++] = req[i];
++        }
++    }
++    prefetch_event(l, cand, nc);
++    g.oracle_events++;
++}
++
+ // Start the exact oracle-route reads for one layer event, into the final victim
+ // slots. Publishes no mapping and touches no LRU metadata.
+ void oracle_early_event(llama_moe_paging_layer & l) {
+@@ -967,6 +1672,10 @@
+ }
+ 
+ void stage_event(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
++    if (g.prefetch_enabled) {
++        stage_event_prefetch(l, req, k, out_slot);
++        return;
++    }
+     if (l.oracle_plan_valid && llama_moe_paging_direct_storage()) {
+         stage_event_oracle_demand(l, req, k, out_slot);
+         return;
+@@ -1473,6 +2182,26 @@
+     g.direct_verify   = getenv_bool("LLAMA_MOE_PAGING_DIRECT_VERIFY", false);
+     g.direct_verify_n = std::max(1, getenv_int("LLAMA_MOE_PAGING_DIRECT_VERIFY_N", 8));
+ 
++    // Execution 015 protected probation prefetch
++    g.demand_slots = m;
++    g.prefetch_p = std::max(0, std::min(32, getenv_int("LLAMA_MOE_PAGING_PREFETCH_P", 0)));
++    g.prefetch_mode = getenv_str("LLAMA_MOE_PAGING_PREFETCH_MODE", "off");
++    g.prefetch_pool = std::max(1, std::min(64, getenv_int("LLAMA_MOE_PAGING_PREFETCH_K", 16)));
++    g.shadow_assert = g.assert_checks || getenv_bool("LLAMA_MOE_PAGING_SHADOW", false);
++    if (g.prefetch_p > 0 && g.prefetch_mode != "off") {
++        const bool usable = g.compute_mode == "direct_sparse" && g.backend == "gguf3" &&
++                            g.policy == "lru" && !g.hot && g.qd > 1;
++        if (!usable) {
++            LLAMA_LOG_WARN("%s: prefetch disabled (needs direct_sparse+gguf3+lru+qd>1+hot=0)\n", __func__);
++            g.prefetch_p = 0;
++            g.prefetch_mode = "off";
++        } else {
++            g.prefetch_enabled = true;
++            g.m_slots = m + g.prefetch_p;
++            g.prefetch_pool = std::max(g.prefetch_p, g.prefetch_pool);
++        }
++    }
++
+     const std::string store = getenv_str("LLAMA_MOE_PAGING_STORE", "cold-experts.bin");
+     if (g.backend != "gguf3") {
+         g.store_fd = open(store.c_str(), O_RDONLY);
+@@ -1627,6 +2356,13 @@
+         l.reserved.assign(g.m_slots, 0);
+         l.early_slot.assign(g.m_slots, 0);
+         l.oracle_reserved.assign(g.m_slots, 0);
++        l.slot_state.assign((size_t) g.m_slots, ST_EMPTY);
++        l.pf_submit_ms.assign((size_t) g.m_slots, 0.0);
++        l.demand_count = 0;
++        l.shadow_expert.assign((size_t) g.demand_slots, -1);
++        l.shadow_last_use.assign((size_t) g.demand_slots, 0);
++        l.shadow_n = 0;
++        l.pf_cand_n = 0;
+         l.stage_expert.assign(g.k_slots, -1);
+         // the byte cache is the staging storage; direct compute reads the slot tensors
+         if (!llama_moe_paging_direct_storage()) {
+@@ -1652,10 +2388,14 @@
+     g.oracle_trace_path = getenv_str("LLAMA_MOE_ORACLE_TRACE", "");
+     g.oracle_mode       = getenv_str("LLAMA_MOE_ORACLE_EARLY", "off");
+     g.oracle_capture    = getenv_bool("LLAMA_MOE_ORACLE_CAPTURE", false);
++    if (g.prefetch_enabled && g.prefetch_mode == "oracle") {
++        g.oracle_mode = "prefetch_oracle";
++    }
+     g.oracle_pending.resize(g.layers.size());
+     for (auto & p : g.oracle_pending) {
+         p = std::make_unique<read_pending>();
+     }
++    g.pf_batches.resize(g.layers.size());
+     if (!g.oracle_trace_path.empty()) {
+         if (g.oracle_capture) {
+             g.oracle_capture_f = fopen(g.oracle_trace_path.c_str(), "wb");
+@@ -1667,7 +2407,8 @@
+             fwrite(magic, 1, 8, g.oracle_capture_f);
+             fwrite(hdr, sizeof(int32_t), 3, g.oracle_capture_f);
+             LLAMA_LOG_INFO("%s: oracle capture -> %s\n", __func__, g.oracle_trace_path.c_str());
+-        } else if (g.oracle_mode == "pre_attn" || g.oracle_mode == "paid_a0") {
++        } else if (g.oracle_mode == "pre_attn" || g.oracle_mode == "paid_a0" ||
++                   g.oracle_mode == "prefetch_oracle") {
+             if (g.compute_mode != "direct_sparse") {
+                 GGML_ABORT("moe oracle: requires compute_mode=direct_sparse");
+             }
+@@ -1785,6 +2526,63 @@
+         g.oracle_a0_events++;
+     }
+     GGML_UNUSED(b);
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++bool llama_moe_paging_prefetch_a0_mode() {
++    return g.enabled && g.prefetch_enabled &&
++           (g.prefetch_mode == "a0" || g.prefetch_mode == "a0_shadow");
++}
++
++bool llama_moe_paging_prefetch_oracle_mode() {
++    return g.enabled && g.prefetch_enabled && g.prefetch_mode == "oracle";
++}
++
++int llama_moe_paging_prefetch_pool() {
++    return g.prefetch_pool;
++}
++
++void llama_moe_paging_prefetch_start(ggml_tensor * dst, const ggml_tensor * a,
++                                     int ith, int nth, void * userdata) {
++    if (ith == 0) {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        l->oracle_layer_start_ms = now_ms();
++    }
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++void llama_moe_paging_prefetch_a0(ggml_tensor * dst, const ggml_tensor * a,
++                                  const ggml_tensor * b, int ith, int nth, void * userdata) {
++    if (ith == 0 && g.prefetch_enabled) {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        l->a0_ready_ms = now_ms();
++        if (l->oracle_layer_start_ms > 0.0) {
++            g.a0_compute_us.push_back((now_ms() - l->oracle_layer_start_ms) * 1000.0);
++        }
++        int64_t npool = b->ne[0];
++        if (npool > 64) {
++            npool = 64;
++        }
++        int32_t pool[64];
++        for (int64_t i = 0; i < npool; i++) {
++            pool[i] = *(const int32_t *) ((const char *) b->data + i * b->nb[0]);
++        }
++        prefetch_event(*l, pool, (int) npool);
++    }
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++void llama_moe_paging_prefetch_oracle(ggml_tensor * dst, const ggml_tensor * a,
++                                      int ith, int nth, void * userdata) {
++    if (ith == 0 && g.prefetch_enabled) {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        l->oracle_layer_start_ms = now_ms();
++        l->a0_ready_ms = now_ms();
++        prefetch_oracle_event(*l);
++    }
+     GGML_UNUSED(nth);
+     memcpy(dst->data, a->data, ggml_nbytes(a));
+ }
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -235,6 +235,36 @@
+             }
+         }
+ 
++        // Execution 015: protected-probation prefetch. a0/a0_shadow insert the
++        // pre-attention advisory branch; oracle replays the captured route. None
++        // of these change routing, demand residency, or output.
++        if (llama_moe_paging_prefetch_a0_mode()) {
++            llama_moe_paging_layer * moe_page_pf = llama_moe_paging_layer_for(il);
++            if (moe_page_pf != nullptr && model.layers[il].attn_post_norm != nullptr &&
++                    model.layers[il].ffn_gate_inp != nullptr) {
++                inpL = ggml_map_custom1(ctx0, inpL, llama_moe_paging_prefetch_start, 1, moe_page_pf);
++                cb(inpL, "ffn_moe_pf_start", il);
++
++                ggml_tensor * a0 = build_norm(inpL, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
++                cb(a0, "ffn_moe_pf_norm", il);
++                a0 = build_lora_mm(model.layers[il].ffn_gate_inp, a0);
++                cb(a0, "ffn_moe_pf_logits", il);
++                a0 = ggml_soft_max(ctx0, a0);
++                cb(a0, "ffn_moe_pf_probs", il);
++                a0 = ggml_argsort_top_k(ctx0, a0, llama_moe_paging_prefetch_pool());
++                cb(a0, "ffn_moe_pf_topk", il);
++
++                inpL = ggml_map_custom2(ctx0, inpL, a0, llama_moe_paging_prefetch_a0, 1, moe_page_pf);
++                cb(inpL, "ffn_moe_pf_a0", il);
++            }
++        } else if (llama_moe_paging_prefetch_oracle_mode()) {
++            llama_moe_paging_layer * moe_page_pf = llama_moe_paging_layer_for(il);
++            if (moe_page_pf != nullptr) {
++                inpL = ggml_map_custom1(ctx0, inpL, llama_moe_paging_prefetch_oracle, 1, moe_page_pf);
++                cb(inpL, "ffn_moe_pf_oracle", il);
++            }
++        }
++
+         ggml_tensor * inpSA = inpL;
+ 
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);

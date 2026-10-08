@@ -1,0 +1,340 @@
+diff --git a/common/moe-trace.cpp b/common/moe-trace.cpp
+index 10a2ecb..1f89880 100644
+--- a/common/moe-trace.cpp
++++ b/common/moe-trace.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-backend.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -20,6 +21,13 @@
+ #define LLAMA_MOE_TRACE_N_EXPERT      256
+ #define LLAMA_MOE_TRACE_N_EXPERT_USED 8
+ 
++enum {
++    MOE_TRACE_STATE_L_OUT          = 0,
++    MOE_TRACE_STATE_ATTN_RESIDUAL  = 1,
++    MOE_TRACE_STATE_INPUT_EMBED    = 2,
++    MOE_TRACE_STATE_ATTN_POST_NORM = 3,
++};
++
+ struct common_moe_trace_state {
+     bool          enabled = false;
+     std::string   path;
+@@ -29,6 +37,24 @@ struct common_moe_trace_state {
+     int32_t prev_layer = -1;
+     bool    first      = true;
+ 
++    // diagnostic router-tail capture (trace only)
++    int      top_n           = 0;
++    bool     score_enabled   = false;
++    uint64_t n_score_records = 0;
++
++    // diagnostic hidden-state capture (trace only)
++    bool          states_enabled = false;
++    std::string   states_path;
++    std::ofstream states_out;
++    uint64_t      n_state_records = 0;
++
++    // diagnostic host-side timing capture (trace only)
++    bool          timing_enabled = false;
++    std::string   timing_path;
++    std::ofstream timing_out;
++    uint64_t      n_timing_records = 0;
++    std::chrono::steady_clock::time_point t0;
++
+     uint64_t n_records    = 0;
+     uint64_t n_err_layer  = 0;
+     uint64_t n_err_expert = 0;
+@@ -46,10 +72,19 @@ struct common_moe_trace_state {
+             out.flush();
+             out.close();
+         }
++        if (states_out.is_open()) {
++            states_out.flush();
++            states_out.close();
++        }
++        if (timing_out.is_open()) {
++            timing_out.flush();
++            timing_out.close();
++        }
+         if (enabled) {
+             fprintf(stderr,
+-                "moe-trace: wrote %llu records to '%s' (errors: layer %llu, expert %llu, n_expert_used %llu)\n",
+-                (unsigned long long) n_records, path.c_str(),
++                "moe-trace: wrote %llu records (%llu score, %llu state, %llu timing; top_n=%d) to '%s' (errors: layer %llu, expert %llu, n_expert_used %llu)\n",
++                (unsigned long long) n_records, (unsigned long long) n_score_records,
++                (unsigned long long) n_state_records, (unsigned long long) n_timing_records, top_n, path.c_str(),
+                 (unsigned long long) n_err_layer, (unsigned long long) n_err_expert, (unsigned long long) n_err_n_used);
+         }
+     }
+@@ -62,6 +97,78 @@ static bool common_moe_trace_is_topk(const char * name) {
+     return name != nullptr && strncmp(name, prefix, sizeof(prefix) - 1) == 0;
+ }
+ 
++// Returns the layer and the score-tensor kind for ffn_moe_probs[-_biased|_masked]-<il>.
++static bool common_moe_trace_score_info(const char * name, int * il, const char ** src) {
++    if (name == nullptr) {
++        return false;
++    }
++    const char * dash = strrchr(name, '-');
++    if (dash == nullptr) {
++        return false;
++    }
++    if (strncmp(name, "ffn_moe_probs_masked", 20) == 0) {
++        *src = "masked";
++    } else if (strncmp(name, "ffn_moe_probs_biased", 20) == 0) {
++        *src = "biased";
++    } else if (strncmp(name, "ffn_moe_probs", 13) == 0) {
++        *src = "probs";
++    } else {
++        return false;
++    }
++    *il = atoi(dash + 1);
++    return true;
++}
++
++// Returns the state kind and layer for l_out-<il>, attn_residual-<il> and model.input_embed.
++static bool common_moe_trace_state_info(const char * name, int * kind, int * il) {
++    if (name == nullptr) {
++        return false;
++    }
++    if (strcmp(name, "model.input_embed") == 0) {
++        *kind = MOE_TRACE_STATE_INPUT_EMBED;
++        *il   = -1;
++        return true;
++    }
++    int l = -1;
++    if (sscanf(name, "l_out-%d", &l) == 1) {
++        *kind = MOE_TRACE_STATE_L_OUT;
++        *il   = l;
++        return true;
++    }
++    if (sscanf(name, "attn_residual-%d", &l) == 1) {
++        *kind = MOE_TRACE_STATE_ATTN_RESIDUAL;
++        *il   = l;
++        return true;
++    }
++    if (sscanf(name, "attn_post_norm-%d", &l) == 1) {
++        *kind = MOE_TRACE_STATE_ATTN_POST_NORM;
++        *il   = l;
++        return true;
++    }
++    return false;
++}
++
++static bool common_moe_trace_timing_info(const char * name, int * il) {
++    if (name == nullptr) {
++        return false;
++    }
++    if (strcmp(name, "model.input_embed") == 0) {
++        *il = -1;
++        return true;
++    }
++    int l = -1;
++    if (sscanf(name, "attn_norm-%d", &l) == 1 ||
++        sscanf(name, "attn_post_norm-%d", &l) == 1 ||
++        sscanf(name, "ffn_moe_logits-%d", &l) == 1 ||
++        sscanf(name, "l_out-%d", &l) == 1 ||
++        sscanf(name, "attn_residual-%d", &l) == 1 ||
++        sscanf(name, "ffn_moe_topk-%d", &l) == 1) {
++        *il = l;
++        return true;
++    }
++    return false;
++}
++
+ static void common_moe_trace_record(ggml_tensor * t) {
+     int il = -1;
+     if (sscanf(t->name, "ffn_moe_topk-%d", &il) != 1) {
+@@ -129,11 +236,108 @@ static void common_moe_trace_record(ggml_tensor * t) {
+     g_moe_trace.out.flush();
+ }
+ 
++// Trace-only: emit the top-N router scores for a single decode token.
++static void common_moe_trace_record_scores(ggml_tensor * t, int il, const char * src) {
++    if (t->type != GGML_TYPE_F32 || g_moe_trace.top_n <= 0) {
++        return;
++    }
++    const int64_t n_expert = t->ne[0];
++    const int64_t n_tokens = t->ne[1];
++    if (n_tokens != 1 || n_expert <= 0) {
++        return;
++    }
++
++    const size_t n_bytes = ggml_nbytes(t);
++    const uint8_t * data = nullptr;
++    if (ggml_backend_buffer_is_host(t->buffer)) {
++        data = (const uint8_t *) t->data;
++    } else {
++        g_moe_trace.buf.resize(n_bytes);
++        ggml_backend_tensor_get(t, g_moe_trace.buf.data(), 0, n_bytes);
++        data = g_moe_trace.buf.data();
++    }
++
++    const int k = (int) std::min<int64_t>(g_moe_trace.top_n, n_expert);
++    std::vector<int> idx((size_t) n_expert);
++    for (int64_t e = 0; e < n_expert; ++e) {
++        idx[(size_t) e] = (int) e;
++    }
++    const auto score_at = [&](int e) -> float {
++        return *(const float *) (data + (size_t) e * t->nb[0]);
++    };
++    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
++                      [&](int a, int b) { return score_at(a) > score_at(b); });
++
++    g_moe_trace.out << "{\"op\":\"scores\",\"src\":\"" << src << "\""
++                    << ",\"phase\":\"decode\""
++                    << ",\"layer\":" << il
++                    << ",\"n_tokens\":1,\"ids\":[";
++    for (int i = 0; i < k; ++i) {
++        if (i > 0) { g_moe_trace.out << ','; }
++        g_moe_trace.out << idx[(size_t) i];
++    }
++    g_moe_trace.out << "],\"scores\":[";
++    for (int i = 0; i < k; ++i) {
++        if (i > 0) { g_moe_trace.out << ','; }
++        g_moe_trace.out << score_at(idx[(size_t) i]);
++    }
++    g_moe_trace.out << "]}\n";
++    g_moe_trace.n_score_records++;
++    g_moe_trace.out.flush();
++}
++
++// Trace-only: append one hidden-state vector as a raw f32 record.
++static void common_moe_trace_record_state(ggml_tensor * t, int kind, int il) {
++    if (t->type != GGML_TYPE_F32 || t->ne[1] != 1) {
++        return;
++    }
++    const int32_t n = (int32_t) t->ne[0];
++    if (n <= 0 || t->nb[0] != sizeof(float)) {
++        return;
++    }
++    const size_t n_bytes = (size_t) n * sizeof(float);
++    const uint8_t * data = nullptr;
++    if (ggml_backend_buffer_is_host(t->buffer)) {
++        data = (const uint8_t *) t->data;
++    } else {
++        g_moe_trace.buf.resize(n_bytes);
++        ggml_backend_tensor_get(t, g_moe_trace.buf.data(), 0, n_bytes);
++        data = g_moe_trace.buf.data();
++    }
++    g_moe_trace.states_out.write((const char *) &kind, sizeof(int32_t));
++    g_moe_trace.states_out.write((const char *) &il,   sizeof(int32_t));
++    g_moe_trace.states_out.write((const char *) &n,    sizeof(int32_t));
++    g_moe_trace.states_out.write((const char *) data,  n_bytes);
++    g_moe_trace.n_state_records++;
++}
++
++static void common_moe_trace_record_timing(const char * name, int il) {
++    using namespace std::chrono;
++    const auto us = duration_cast<microseconds>(steady_clock::now() - g_moe_trace.t0).count();
++    g_moe_trace.timing_out << "{\"name\":\"" << name << "\",\"layer\":" << il
++                           << ",\"us\":" << (long long) us << "}\n";
++    g_moe_trace.n_timing_records++;
++}
++
+ static bool common_moe_trace_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+     (void) user_data;
+ 
+     if (ask) {
+         bool want = common_moe_trace_is_topk(t->name);
++        if (!want && g_moe_trace.score_enabled) {
++            int il = -1;
++            const char * src = nullptr;
++            want = common_moe_trace_score_info(t->name, &il, &src);
++        }
++        if (!want && g_moe_trace.states_enabled && t->ne[1] == 1) {
++            int kind = -1;
++            int il   = -1;
++            want = common_moe_trace_state_info(t->name, &kind, &il);
++        }
++        if (!want && g_moe_trace.timing_enabled) {
++            int il = -1;
++            want = common_moe_trace_timing_info(t->name, &il);
++        }
+         if (g_moe_trace.prev_cb != nullptr) {
+             want = g_moe_trace.prev_cb(t, true, g_moe_trace.prev_cb_user_data) || want;
+         }
+@@ -150,6 +354,27 @@ static bool common_moe_trace_cb_eval(ggml_tensor * t, bool ask, void * user_data
+ 
+     if (common_moe_trace_is_topk(t->name)) {
+         common_moe_trace_record(t);
++    } else if (g_moe_trace.score_enabled) {
++        int il = -1;
++        const char * src = nullptr;
++        if (common_moe_trace_score_info(t->name, &il, &src)) {
++            common_moe_trace_record_scores(t, il, src);
++        }
++    }
++
++    if (g_moe_trace.states_enabled) {
++        int kind = -1;
++        int il   = -1;
++        if (common_moe_trace_state_info(t->name, &kind, &il)) {
++            common_moe_trace_record_state(t, kind, il);
++        }
++    }
++
++    if (g_moe_trace.timing_enabled) {
++        int il = -1;
++        if (common_moe_trace_timing_info(t->name, &il)) {
++            common_moe_trace_record_timing(t->name, il);
++        }
+     }
+     return true;
+ }
+@@ -162,11 +387,48 @@ void common_moe_trace_apply(const common_params & params, llama_context_params &
+             path = env;
+         }
+     }
+-    if (path.empty()) {
++
++    const char * top_env = getenv("LLAMA_MOE_TRACE_TOP");
++    g_moe_trace.top_n = (top_env != nullptr && top_env[0] != '\0') ? atoi(top_env) : 0;
++    g_moe_trace.score_enabled = g_moe_trace.top_n > 0;
++
++    const char * st_env = getenv("LLAMA_MOE_TRACE_STATES");
++    if (st_env != nullptr && st_env[0] != '\0' && g_moe_trace.states_path != st_env) {
++        if (g_moe_trace.states_out.is_open()) {
++            g_moe_trace.states_out.close();
++        }
++        g_moe_trace.states_out.open(st_env, std::ios::out | std::ios::trunc | std::ios::binary);
++        if (g_moe_trace.states_out.is_open()) {
++            g_moe_trace.states_path    = st_env;
++            g_moe_trace.states_enabled = true;
++        } else {
++            fprintf(stderr, "moe-trace: failed to open states '%s'\n", st_env);
++        }
++    }
++
++    const char * tm_env = getenv("LLAMA_MOE_TRACE_TIMING");
++    if (tm_env != nullptr && tm_env[0] != '\0' && g_moe_trace.timing_path != tm_env) {
++        if (g_moe_trace.timing_out.is_open()) {
++            g_moe_trace.timing_out.close();
++        }
++        g_moe_trace.timing_out.open(tm_env, std::ios::out | std::ios::trunc);
++        if (g_moe_trace.timing_out.is_open()) {
++            g_moe_trace.timing_path    = tm_env;
++            g_moe_trace.timing_enabled = true;
++            g_moe_trace.t0 = std::chrono::steady_clock::now();
++        } else {
++            fprintf(stderr, "moe-trace: failed to open timing '%s'\n", tm_env);
++        }
++    }
++
++    // Timing-only runs set LLAMA_MOE_TRACE_TIMING with no routing trace path.
++    // The eval callback must still be installed so timestamps are recorded.
++    const bool timing_only = path.empty() && !g_moe_trace.timing_path.empty();
++    if (path.empty() && !timing_only) {
+         return;
+     }
+ 
+-    if (!g_moe_trace.enabled || g_moe_trace.path != path) {
++    if (!path.empty() && (!g_moe_trace.enabled || g_moe_trace.path != path)) {
+         if (g_moe_trace.out.is_open()) {
+             g_moe_trace.out.close();
+         }

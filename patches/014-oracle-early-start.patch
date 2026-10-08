@@ -1,0 +1,694 @@
+diff --git a/src/llama-moe-paging.h b/src/llama-moe-paging.h
+--- a/src/llama-moe-paging.h
++++ b/src/llama-moe-paging.h
+@@ -117,6 +117,19 @@
+     uint64_t direct_repack_bytes      = 0;
+     double   compute_ms = 0.0;    // router weights -> expert down projection
+     double   compute_start_ms = 0.0;
++
++    // Execution 014 diagnostic oracle early-start. Only direct_sparse uses these.
++    // early_slot: 0 none, 1 EARLY_RESERVED, 2 EARLY_LOADING.
++    std::vector<uint8_t> early_slot;
++    std::vector<uint8_t> oracle_reserved;  // plan scratch
++    bool    oracle_plan_valid = false;
++    int     oracle_n_miss = 0;
++    int64_t oracle_event = -1;
++    int32_t oracle_req[8]  = {};
++    int32_t oracle_slot[8] = {};
++    bool    oracle_is_miss[8] = {};
++    double  oracle_submit_ms = 0.0;
++    double  oracle_layer_start_ms = 0.0;
+ };
+ 
+ // Idempotent. Reads the env vars:
+@@ -154,6 +167,28 @@
+ // instead of on the K8 staging tensors.
+ bool llama_moe_paging_direct_mode();
+ 
++// Execution 014: true when the diagnostic perfect-oracle pre_attn early-start is
++// active. The graph inserts the pre-attention marker only in that mode.
++bool llama_moe_paging_oracle_pre_attn();
++
++// Execution 014: ggml custom op executed when the pre-attention layer state is
++// ready. It starts the exact oracle-route reads for this layer event and passes
++// the hidden state through unchanged.
++void llama_moe_paging_oracle_pre(ggml_tensor * dst, const ggml_tensor * a,
++                                 int ith, int nth, void * userdata);
++
++// Execution 014: true when the paid_a0 diagnostic mode is active.
++bool llama_moe_paging_oracle_paid_a0();
++
++// Execution 014 CORRECTION: pre-attention A0 branch ops. The start op stamps the
++// layer-start time and passes the layer input through. The barrier op consumes
++// the layer input and the A0 Top-k and returns the layer input unchanged, so the
++// attention path cannot run before the paid predictor.
++void llama_moe_paging_oracle_a0_start(ggml_tensor * dst, const ggml_tensor * a,
++                                      int ith, int nth, void * userdata);
++void llama_moe_paging_oracle_a0_barrier(ggml_tensor * dst, const ggml_tensor * a,
++                                        const ggml_tensor * b, int ith, int nth, void * userdata);
++
+ // Execution 009: resolve the global expert ids in `a` to resident slot ids and
+ // page any missing expert directly into its final resident slot. Writes ascending
+ // resident-slot ids to dst. Registered as a ggml custom op.
+diff --git a/src/llama-moe-paging.cpp b/src/llama-moe-paging.cpp
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -19,6 +19,7 @@
+ #include <cstring>
+ #include <deque>
+ #include <fcntl.h>
++#include <memory>
+ #include <mutex>
+ #include <string>
+ #include <sys/stat.h>
+@@ -76,6 +77,14 @@
+     std::atomic<bool> failed {false};
+     std::mutex m;
+     std::condition_variable cv;
++};
++
++// Async read handle. The caller must keep it alive until wait_read_tasks returns.
++struct read_pending {
++    read_batch batch;
++    bool   submitted = false;
++    bool   async     = false;
++    bool   ok        = true;
+ };
+ 
+ struct io_task {
+@@ -140,6 +149,35 @@
+     uint64_t hist[HIST_BUCKETS]        = {};
+     uint64_t readset_hist[HIST_BUCKETS] = {};
+ 
++    // Execution 014 diagnostic perfect-oracle early-start
++    bool         oracle_enabled = false;
++    bool         oracle_capture = false;
++    std::string  oracle_mode = "off";    // off | pre_attn | paid_a0
++    std::string  oracle_trace_path;
++    int          oracle_k = 8;
++    std::vector<int32_t> oracle_routes;  // n_token * n_layer * k, token-major
++    uint64_t     oracle_n_token = 0;
++    std::vector<std::unique_ptr<read_pending>> oracle_pending;  // one per layer
++    FILE *       oracle_capture_f = nullptr;
++    uint64_t     oracle_capture_events = 0;
++
++    uint64_t oracle_events = 0;
++    uint64_t oracle_a0_events = 0;
++    uint64_t oracle_route_matches = 0;
++    uint64_t oracle_route_mismatches = 0;
++    uint64_t early_readsets_submitted = 0;
++    uint64_t early_experts_submitted = 0;
++    uint64_t early_bytes = 0;
++    uint64_t early_ready_before_demand = 0;
++    uint64_t early_join_inflight = 0;
++    double   early_wait_ms_at_demand = 0.0;
++    double   early_hidden_ms = 0.0;
++    std::vector<double> early_lead_us;
++    std::vector<double> a0_compute_us;
++    uint64_t victim_plan_matches = 0;
++    uint64_t victim_plan_mismatches = 0;
++    uint64_t duplicate_reads = 0;
++
+     // worker pool
+     std::mutex mtx;
+     std::condition_variable cv_task;
+@@ -289,13 +327,6 @@
+ 
+ // Async read submission for overlap/persistent modes. The caller must keep `p`
+ // alive until wait_read_tasks returns. QD1 stays synchronous (nothing to overlap).
+-struct read_pending {
+-    read_batch batch;
+-    bool   submitted = false;
+-    bool   async     = false;
+-    bool   ok        = true;
+-};
+-
+ void submit_read_tasks(const std::vector<io_task> & tasks, read_pending & p) {
+     p.submitted = true;
+     p.ok = true;
+@@ -421,6 +452,26 @@
+                    (unsigned long long) n_layer, (unsigned long long) token_events_derived);
+     }
+ 
++    std::vector<double> lead_sorted = g.early_lead_us;
++    std::sort(lead_sorted.begin(), lead_sorted.end());
++    auto lead_pct = [&](double q) -> double {
++        if (lead_sorted.empty()) {
++            return 0.0;
++        }
++        double idx = q * (double) (lead_sorted.size() - 1);
++        return lead_sorted[(size_t) idx];
++    };
++
++    std::vector<double> a0_sorted = g.a0_compute_us;
++    std::sort(a0_sorted.begin(), a0_sorted.end());
++    auto a0_pct = [&](double q) -> double {
++        if (a0_sorted.empty()) {
++            return 0.0;
++        }
++        double idx = q * (double) (a0_sorted.size() - 1);
++        return a0_sorted[(size_t) idx];
++    };
++
+     fprintf(f, "{\n");
+     fprintf(f, " \"mode\": \"cpu_hybrid_staging_paging\",\n");
+     fprintf(f, " \"backend\": \"%s\",\n", g.backend.c_str());
+@@ -439,6 +490,29 @@
+     fprintf(f, " \"token_events\": %llu,\n", (unsigned long long) token_events);
+     fprintf(f, " \"token_events_derived\": %llu,\n", (unsigned long long) token_events_derived);
+     fprintf(f, " \"token_events_canonical_ok\": %s,\n", token_events_canonical_ok ? "true" : "false");
++    fprintf(f, " \"oracle_enabled\": %s,\n", g.oracle_enabled ? "true" : "false");
++    fprintf(f, " \"oracle_mode\": \"%s\",\n", g.oracle_mode.c_str());
++    fprintf(f, " \"oracle_k\": %d,\n", g.oracle_k);
++    fprintf(f, " \"oracle_trace_tokens\": %llu,\n", (unsigned long long) g.oracle_n_token);
++    fprintf(f, " \"oracle_capture_events\": %llu,\n", (unsigned long long) g.oracle_capture_events);
++    fprintf(f, " \"oracle_events\": %llu,\n", (unsigned long long) g.oracle_events);
++    fprintf(f, " \"oracle_route_matches\": %llu,\n", (unsigned long long) g.oracle_route_matches);
++    fprintf(f, " \"oracle_route_mismatches\": %llu,\n", (unsigned long long) g.oracle_route_mismatches);
++    fprintf(f, " \"early_readsets_submitted\": %llu,\n", (unsigned long long) g.early_readsets_submitted);
++    fprintf(f, " \"early_experts_submitted\": %llu,\n", (unsigned long long) g.early_experts_submitted);
++    fprintf(f, " \"early_bytes\": %llu,\n", (unsigned long long) g.early_bytes);
++    fprintf(f, " \"early_ready_before_demand\": %llu,\n", (unsigned long long) g.early_ready_before_demand);
++    fprintf(f, " \"early_join_inflight\": %llu,\n", (unsigned long long) g.early_join_inflight);
++    fprintf(f, " \"early_wait_ms_at_demand\": %.3f,\n", g.early_wait_ms_at_demand);
++    fprintf(f, " \"early_hidden_ms\": %.3f,\n", g.early_hidden_ms);
++    fprintf(f, " \"early_lead_us_p50\": %.3f,\n", lead_pct(0.50));
++    fprintf(f, " \"early_lead_us_p95\": %.3f,\n", lead_pct(0.95));
++    fprintf(f, " \"oracle_a0_events\": %llu,\n", (unsigned long long) g.oracle_a0_events);
++    fprintf(f, " \"a0_compute_us_p50\": %.3f,\n", a0_pct(0.50));
++    fprintf(f, " \"a0_compute_us_p95\": %.3f,\n", a0_pct(0.95));
++    fprintf(f, " \"victim_plan_matches\": %llu,\n", (unsigned long long) g.victim_plan_matches);
++    fprintf(f, " \"victim_plan_mismatches\": %llu,\n", (unsigned long long) g.victim_plan_mismatches);
++    fprintf(f, " \"duplicate_reads\": %llu,\n", (unsigned long long) g.duplicate_reads);
+     fprintf(f, " \"hot_fill_semantics\": \"%s\",\n",
+             g.hot ? "synthetic_single_record" : "exact_model_bytes");
+     fprintf(f, " \"hits\": %llu,\n", (unsigned long long) hits);
+@@ -532,8 +606,21 @@
+     fclose(f);
+ }
+ 
++void oracle_capture_close() {
++    if (g.oracle_capture_f != nullptr) {
++        fflush(g.oracle_capture_f);
++        int32_t hdr[3] = { g.n_layer, g.oracle_k, (int32_t) g.oracle_capture_events };
++        if (fseek(g.oracle_capture_f, 8, SEEK_SET) == 0) {
++            fwrite(hdr, sizeof(int32_t), 3, g.oracle_capture_f);
++        }
++        fclose(g.oracle_capture_f);
++        g.oracle_capture_f = nullptr;
++    }
++}
++
+ void atexit_handler() {
+     pool_stop();
++    oracle_capture_close();
+     dump_stats();
+ }
+ 
+@@ -619,6 +706,242 @@
+     return slot;
+ }
+ 
++// Same victim policy as pick_victim, but with an explicit reservation mask so a
++// plan pass never mutates the live LRU metadata.
++int pick_victim_ex(const llama_moe_paging_layer & l, const uint8_t * reserved) {
++    int slot = -1;
++    for (int s = 0; s < l.n_slots; s++) {
++        if (reserved[s]) {
++            continue;
++        }
++        if (l.slot_expert[s] < 0) {
++            return s;
++        }
++    }
++    const bool decay = g.policy == "event_decay90";
++    for (int s = 0; s < l.n_slots; s++) {
++        if (reserved[s]) {
++            continue;
++        }
++        if (slot < 0) {
++            slot = s;
++            continue;
++        }
++        const bool better = decay ? (l.score[s] < l.score[slot]) : (l.last_use[s] < l.last_use[slot]);
++        if (better) {
++            slot = s;
++        }
++    }
++    return slot;
++}
++
++// Deterministic hit/miss/victim plan for one layer event. It reads only the
++// pre-event cache state, so the early plan and a later demand recompute must be
++// identical. reserved is caller scratch of size l.n_slots.
++void plan_event(const llama_moe_paging_layer & l, const int32_t * req, int k,
++                int32_t * slot_out, bool * is_miss_out, int * miss_i_out,
++                int * n_miss_out, uint8_t * reserved) {
++    std::fill(reserved, reserved + l.n_slots, (uint8_t) 0);
++    int n_miss = 0;
++    for (int i = 0; i < k; i++) {
++        const int s = find_slot(l, req[i]);
++        slot_out[i] = s;
++        if (s >= 0) {
++            is_miss_out[i] = false;
++            reserved[s] = 1;
++        } else {
++            is_miss_out[i] = true;
++            miss_i_out[n_miss++] = i;
++        }
++    }
++    for (int m = 0; m < n_miss; m++) {
++        const int s = pick_victim_ex(l, reserved);
++        if (s < 0) {
++            GGML_ABORT("moe paging: no victim slot available (M=%d, misses=%d)", l.n_slots, n_miss);
++        }
++        reserved[s] = 1;
++        slot_out[miss_i_out[m]] = s;
++    }
++    *n_miss_out = n_miss;
++}
++
++// Start the exact oracle-route reads for one layer event, into the final victim
++// slots. Publishes no mapping and touches no LRU metadata.
++void oracle_early_event(llama_moe_paging_layer & l) {
++    if (!g.oracle_enabled || !llama_moe_paging_direct_storage()) {
++        return;
++    }
++    if (l.oracle_plan_valid) {
++        GGML_ABORT("moe oracle: layer %d already has a pending early plan", l.il);
++    }
++    const int64_t n_layer = g.n_layer;
++    const int64_t ev = (int64_t) g.tokens * n_layer + l.il;
++    const int64_t total = (int64_t) g.oracle_n_token * n_layer;
++    if (ev < 0 || ev >= total) {
++        GGML_ABORT("moe oracle: route trace exhausted at token %llu layer %d (events=%lld)",
++                   (unsigned long long) g.tokens, l.il, (long long) total);
++    }
++    const int k = g.oracle_k;
++    int32_t req[8];
++    for (int i = 0; i < k; i++) {
++        req[i] = g.oracle_routes[(size_t) ev * (size_t) k + i];
++    }
++
++    int32_t slot[8];
++    bool is_miss[8] = {};
++    int miss_i[8] = {};
++    int n_miss = 0;
++    plan_event(l, req, k, slot, is_miss, miss_i, &n_miss, l.oracle_reserved.data());
++    for (int i = 0; i < k; i++) {
++        for (int j = 0; j < i; j++) {
++            if (slot[i] == slot[j]) {
++                g.duplicate_reads++;
++                GGML_ABORT("moe oracle: duplicate victim slot; fail closed");
++            }
++        }
++    }
++
++    l.oracle_plan_valid = true;
++    l.oracle_event = ev;
++    l.oracle_n_miss = n_miss;
++    l.oracle_submit_ms = now_ms();
++    if (l.oracle_layer_start_ms > 0.0) {
++        g.a0_compute_us.push_back((l.oracle_submit_ms - l.oracle_layer_start_ms) * 1000.0);
++    }
++    for (int i = 0; i < k; i++) {
++        l.oracle_req[i] = req[i];
++        l.oracle_slot[i] = slot[i];
++        l.oracle_is_miss[i] = is_miss[i];
++    }
++
++    std::fill(l.early_slot.begin(), l.early_slot.end(), (uint8_t) 0);
++    for (int i = 0; i < k; i++) {
++        l.early_slot[slot[i]] = 1;  // EARLY_RESERVED
++    }
++
++    std::vector<io_task> tasks;
++    tasks.reserve((size_t) n_miss * 3);
++    for (int m = 0; m < n_miss; m++) {
++        const int i = miss_i[m];
++        build_read_tasks(l, req[i], slot[i], tasks);
++        l.early_slot[slot[i]] = 2;  // EARLY_LOADING
++    }
++
++    auto & p = *g.oracle_pending[l.il];
++    p.submitted = false;
++    p.async = false;
++    p.ok = true;
++    if (!tasks.empty()) {
++        submit_read_tasks(tasks, p);
++    }
++
++    g.oracle_events++;
++    if (!tasks.empty()) {
++        g.early_readsets_submitted++;
++        g.early_experts_submitted += (uint64_t) n_miss;
++        for (const auto & t : tasks) {
++            g.early_bytes += (uint64_t) t.size;
++        }
++    }
++}
++
++// Authoritative demand: verify the oracle route, re-derive the plan, join the
++// in-flight reads, and only then commit the normal cache metadata.
++void stage_event_oracle_demand(llama_moe_paging_layer & l, const int32_t * req, int k,
++                               int32_t * out_slot) {
++    if (k != g.oracle_k) {
++        g.oracle_route_mismatches++;
++        GGML_ABORT("moe oracle: n_expert_used=%d != oracle k=%d; fail closed", k, g.oracle_k);
++    }
++    for (int i = 0; i < k; i++) {
++        if (req[i] != l.oracle_req[i]) {
++            g.oracle_route_mismatches++;
++            fprintf(stderr, "ORACLE ROUTE MISMATCH token=%llu layer=%d pos=%d native=%d oracle=%d\n",
++                    (unsigned long long) g.tokens, l.il, i, req[i], l.oracle_req[i]);
++            GGML_ABORT("moe oracle: native ordered Top-8 != oracle route; fail closed");
++        }
++    }
++    g.oracle_route_matches++;
++
++    int32_t slot[8];
++    bool is_miss[8] = {};
++    int miss_i[8] = {};
++    int n_miss = 0;
++    plan_event(l, req, k, slot, is_miss, miss_i, &n_miss, l.oracle_reserved.data());
++
++    bool plan_ok = (n_miss == l.oracle_n_miss);
++    for (int i = 0; i < k && plan_ok; i++) {
++        if (slot[i] != l.oracle_slot[i] || is_miss[i] != l.oracle_is_miss[i]) {
++            plan_ok = false;
++        }
++    }
++    if (!plan_ok) {
++        g.victim_plan_mismatches++;
++        GGML_ABORT("moe oracle: demand victim plan != reservation plan (layer %d); fail closed", l.il);
++    }
++    g.victim_plan_matches++;
++
++    const double demand_ms = now_ms();
++    auto & p = *g.oracle_pending[l.il];
++    const bool ready = p.submitted && (!p.async || p.batch.remaining.load() == 0);
++    if (ready) {
++        g.early_ready_before_demand++;
++    } else {
++        g.early_join_inflight++;
++    }
++    const double w0 = now_ms();
++    const bool rok = wait_read_tasks(p);
++    const double w1 = now_ms();
++    g.early_wait_ms_at_demand += (w1 - w0);
++    if (!rok) {
++        GGML_ABORT("moe oracle: early read set failed (layer %d); fail closed", l.il);
++    }
++
++    const bool decay = g.policy == "event_decay90";
++    std::fill(l.reserved.begin(), l.reserved.end(), (uint8_t) 0);
++    for (int i = 0; i < k; i++) {
++        const int s = slot[i];
++        l.reserved[s] = 1;
++        if (!is_miss[i]) {
++            l.hits++;
++            l.last_use[s] = ++g.clock;
++            if (decay) {
++                l.score[s] += 1.0;
++            }
++        }
++    }
++    for (int m = 0; m < n_miss; m++) {
++        const int i = miss_i[m];
++        const int s = slot[i];
++        if (l.slot_expert[s] >= 0) {
++            l.evictions++;
++        }
++        l.slot_expert[s] = req[i];
++        l.last_use[s] = ++g.clock;
++        l.score[s] = decay ? 1.0 : 0.0;
++        l.misses++;
++        l.bytes_read += (uint64_t) g.record_stride;
++    }
++    l.miss_hist[std::min(n_miss, 8)]++;
++    l.events++;
++    for (int j = 0; j < k; j++) {
++        out_slot[j] = slot[j];
++    }
++    l.direct_calls++;
++    const double now = now_ms();
++    l.stage_wall_ms += now - l.oracle_submit_ms;
++    l.readset_wall_ms += demand_ms - l.oracle_submit_ms;
++    l.read_wait_ms += (w1 - w0);
++    l.fault_ms += (w1 - w0);
++    l.compute_start_ms = now;
++    g.early_hidden_ms += std::max(0.0, demand_ms - l.oracle_submit_ms);
++    g.early_lead_us.push_back((demand_ms - l.oracle_submit_ms) * 1000.0);
++
++    l.oracle_plan_valid = false;
++    std::fill(l.early_slot.begin(), l.early_slot.end(), (uint8_t) 0);
++    l.oracle_submit_ms = 0.0;
++}
++
+ // --- Execution 008 staging copy helpers -------------------------------------
+ 
+ // copy a record (gate/up/down at the component offsets) into stage position j
+@@ -645,6 +968,10 @@
+ }
+ 
+ void stage_event(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
++    if (l.oracle_plan_valid && llama_moe_paging_direct_storage()) {
++        stage_event_oracle_demand(l, req, k, out_slot);
++        return;
++    }
+     const bool decay = g.policy == "event_decay90";
+ 
+     // event-decay90: one decay of every resident score per layer event
+@@ -1299,6 +1626,8 @@
+         l.last_use.assign(g.m_slots, 0);
+         l.score.assign(g.m_slots, 0.0);
+         l.reserved.assign(g.m_slots, 0);
++        l.early_slot.assign(g.m_slots, 0);
++        l.oracle_reserved.assign(g.m_slots, 0);
+         l.stage_expert.assign(g.k_slots, -1);
+         // the byte cache is the staging storage; direct compute reads the slot tensors
+         if (!llama_moe_paging_direct_storage()) {
+@@ -1316,6 +1645,81 @@
+     if (g.qd > 1) {
+         for (int i = 0; i < g.qd; i++) {
+             g.workers.emplace_back(worker_main);
++        }
++    }
++
++    // Execution 014 diagnostic perfect-oracle early-start. Capture writes the
++    // authoritative ordered Top-8 per layer event; pre_attn/paid_a0 replay it.
++    g.oracle_trace_path = getenv_str("LLAMA_MOE_ORACLE_TRACE", "");
++    g.oracle_mode       = getenv_str("LLAMA_MOE_ORACLE_EARLY", "off");
++    g.oracle_capture    = getenv_bool("LLAMA_MOE_ORACLE_CAPTURE", false);
++    g.oracle_pending.resize(g.layers.size());
++    for (auto & p : g.oracle_pending) {
++        p = std::make_unique<read_pending>();
++    }
++    if (!g.oracle_trace_path.empty()) {
++        if (g.oracle_capture) {
++            g.oracle_capture_f = fopen(g.oracle_trace_path.c_str(), "wb");
++            if (g.oracle_capture_f == nullptr) {
++                GGML_ABORT("moe oracle: cannot write route trace '%s'", g.oracle_trace_path.c_str());
++            }
++            const char magic[8] = {'M','O','E','O','R','T','0','1'};
++            int32_t hdr[3] = { g.n_layer, g.k_slots, 0 };
++            fwrite(magic, 1, 8, g.oracle_capture_f);
++            fwrite(hdr, sizeof(int32_t), 3, g.oracle_capture_f);
++            LLAMA_LOG_INFO("%s: oracle capture -> %s\n", __func__, g.oracle_trace_path.c_str());
++        } else if (g.oracle_mode == "pre_attn" || g.oracle_mode == "paid_a0") {
++            if (g.compute_mode != "direct_sparse") {
++                GGML_ABORT("moe oracle: requires compute_mode=direct_sparse");
++            }
++            if (g.backend != "gguf3") {
++                GGML_ABORT("moe oracle: requires backend=gguf3");
++            }
++            if (g.policy != "lru") {
++                GGML_ABORT("moe oracle: requires policy=lru");
++            }
++            if (g.hot) {
++                GGML_ABORT("moe oracle: requires hot=0");
++            }
++            if (g.qd <= 1) {
++                GGML_ABORT("moe oracle: requires qd>1 for early reads");
++            }
++            FILE * f = fopen(g.oracle_trace_path.c_str(), "rb");
++            if (f == nullptr) {
++                GGML_ABORT("moe oracle: cannot read route trace '%s'", g.oracle_trace_path.c_str());
++            }
++            char magic[8];
++            int32_t hdr[3];
++            if (fread(magic, 1, 8, f) != 8 || fread(hdr, sizeof(int32_t), 3, f) != 3 ||
++                    memcmp(magic, "MOEORT01", 8) != 0) {
++                fclose(f);
++                GGML_ABORT("moe oracle: bad route trace header '%s'", g.oracle_trace_path.c_str());
++            }
++            const int32_t nl = hdr[0], kk = hdr[1], nev = hdr[2];
++            if (nl != g.n_layer) {
++                fclose(f);
++                GGML_ABORT("moe oracle: trace n_layer=%d != %d", nl, g.n_layer);
++            }
++            if (kk <= 0 || kk > 8) {
++                fclose(f);
++                GGML_ABORT("moe oracle: trace k=%d unsupported", kk);
++            }
++            if (nev <= 0 || (nev % nl) != 0) {
++                fclose(f);
++                GGML_ABORT("moe oracle: trace events %d not a multiple of n_layer %d", nev, nl);
++            }
++            g.oracle_k = kk;
++            g.oracle_n_token = (uint64_t) (nev / nl);
++            g.oracle_routes.resize((size_t) nev * (size_t) kk);
++            const size_t got = fread(g.oracle_routes.data(), sizeof(int32_t), g.oracle_routes.size(), f);
++            fclose(f);
++            if (got != g.oracle_routes.size()) {
++                GGML_ABORT("moe oracle: short route trace (%zu of %zu)", got, g.oracle_routes.size());
++            }
++            g.oracle_enabled = true;
++            LLAMA_LOG_INFO("%s: oracle early-start mode=%s tokens=%llu k=%d trace=%s\n",
++                           __func__, g.oracle_mode.c_str(), (unsigned long long) g.oracle_n_token,
++                           g.oracle_k, g.oracle_trace_path.c_str());
+         }
+     }
+ 
+@@ -1340,6 +1744,50 @@
+ 
+ bool llama_moe_paging_direct_mode() {
+     return g.enabled && llama_moe_paging_direct_storage();
++}
++
++bool llama_moe_paging_oracle_pre_attn() {
++    return g.enabled && g.oracle_enabled && g.oracle_mode == "pre_attn";
++}
++
++void llama_moe_paging_oracle_pre(ggml_tensor * dst, const ggml_tensor * a,
++                                 int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    GGML_UNUSED(nth);
++    auto * l = (llama_moe_paging_layer *) userdata;
++    if (g.oracle_mode == "pre_attn") {
++        oracle_early_event(*l);
++    }
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++bool llama_moe_paging_oracle_paid_a0() {
++    return g.enabled && g.oracle_enabled && g.oracle_mode == "paid_a0";
++}
++
++void llama_moe_paging_oracle_a0_start(ggml_tensor * dst, const ggml_tensor * a,
++                                      int ith, int nth, void * userdata) {
++    if (ith == 0 && g.oracle_mode == "paid_a0") {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        l->oracle_layer_start_ms = now_ms();
++    }
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++}
++
++void llama_moe_paging_oracle_a0_barrier(ggml_tensor * dst, const ggml_tensor * a,
++                                        const ggml_tensor * b, int ith, int nth,
++                                        void * userdata) {
++    if (ith == 0 && g.oracle_mode == "paid_a0") {
++        auto * l = (llama_moe_paging_layer *) userdata;
++        oracle_early_event(*l);
++        g.oracle_a0_events++;
++    }
++    GGML_UNUSED(b);
++    GGML_UNUSED(nth);
++    memcpy(dst->data, a->data, ggml_nbytes(a));
+ }
+ 
+ void llama_moe_paging_slots(ggml_tensor * dst, const ggml_tensor * a,
+@@ -1359,6 +1807,10 @@
+         int32_t slot[MAX_K];
+         for (int64_t i = 0; i < k; i++) {
+             req[i] = *(const int32_t *) ((const char *) a->data + t * a->nb[1] + i * a->nb[0]);
++        }
++        if (g.oracle_capture && g.oracle_capture_f != nullptr && l->il >= 0) {
++            fwrite(req, sizeof(int32_t), (size_t) k, g.oracle_capture_f);
++            g.oracle_capture_events++;
+         }
+         stage_event(*l, req, (int) k, slot);
+         for (int64_t i = 0; i < k; i++) {
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-moe-paging.h"
+ 
+ #include "gguf.h"
+ 
+@@ -199,6 +200,41 @@
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
++        // Execution 014: pre_attn oracle starts the exact same-layer reads at the
++        // layer start, before any attention compute.
++        if (llama_moe_paging_oracle_pre_attn()) {
++            llama_moe_paging_layer * moe_page_pre = llama_moe_paging_layer_for(il);
++            if (moe_page_pre != nullptr) {
++                inpL = ggml_map_custom1(ctx0, inpL, llama_moe_paging_oracle_pre, 1, moe_page_pre);
++                cb(inpL, "ffn_moe_oracle_pre", il);
++            }
++        }
++
++        // Execution 014 CORRECTION: true pre-attention A0 branch. It reads the
++        // layer input, not the authoritative post-attention router input. The
++        // barrier op consumes both the layer input and the A0 Top-4 so the
++        // attention path cannot be scheduled before the predictor is ready.
++        if (llama_moe_paging_oracle_paid_a0()) {
++            llama_moe_paging_layer * moe_page_a0 = llama_moe_paging_layer_for(il);
++            if (moe_page_a0 != nullptr && model.layers[il].attn_post_norm != nullptr &&
++                    model.layers[il].ffn_gate_inp != nullptr) {
++                inpL = ggml_map_custom1(ctx0, inpL, llama_moe_paging_oracle_a0_start, 1, moe_page_a0);
++                cb(inpL, "ffn_moe_a0_start", il);
++
++                ggml_tensor * a0 = build_norm(inpL, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
++                cb(a0, "ffn_moe_a0_norm", il);
++                a0 = build_lora_mm(model.layers[il].ffn_gate_inp, a0);
++                cb(a0, "ffn_moe_a0_logits", il);
++                a0 = ggml_soft_max(ctx0, a0);
++                cb(a0, "ffn_moe_a0_probs", il);
++                a0 = ggml_argsort_top_k(ctx0, a0, 4);
++                cb(a0, "ffn_moe_a0_topk", il);
++
++                inpL = ggml_map_custom2(ctx0, inpL, a0, llama_moe_paging_oracle_a0_barrier, 1, moe_page_a0);
++                cb(inpL, "ffn_moe_a0_barrier", il);
++            }
++        }
++
+         ggml_tensor * inpSA = inpL;
+ 
+         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1493,6 +1493,24 @@
+         }
+     ));
+     add_opt(common_arg(
++        {"--moe-oracle-route-trace"}, "PATH",
++        "Execution 014 diagnostic oracle route trace (compact binary). With "
++        "LLAMA_MOE_ORACLE_CAPTURE=1 the run captures the native ordered Top-8 per "
++        "layer event; with LLAMA_MOE_ORACLE_EARLY=pre_attn|paid_a0 it replays one",
++        [](common_params & params, const std::string & value) {
++            (void) params;
++            setenv("LLAMA_MOE_ORACLE_TRACE", value.c_str(), 1);
++        }
++    ));
++    add_opt(common_arg(
++        {"--moe-oracle-early"}, "MODE",
++        "Execution 014 diagnostic oracle early-start mode: off | pre_attn | paid_a0",
++        [](common_params & params, const std::string & value) {
++            (void) params;
++            setenv("LLAMA_MOE_ORACLE_EARLY", value.c_str(), 1);
++        }
++    ));
++    add_opt(common_arg(
+         {"--display-prompt"},
+         {"--no-display-prompt"},
+         string_format("whether to print prompt at generation (default: %s)", params.display_prompt ? "true" : "false"),

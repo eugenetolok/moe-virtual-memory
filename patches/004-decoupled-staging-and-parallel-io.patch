@@ -1,0 +1,1098 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc..83d888e 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -33,6 +33,7 @@ set(LLAMA_CORE_SOURCES
+     llama-memory-hybrid-idx.cpp
+     llama-memory-recurrent.cpp
+     llama-mmap.cpp
++    llama-moe-paging.cpp
+     llama-model-loader.cpp
+     llama-model-saver.cpp
+     llama-model.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 99e55da..3f8e959 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -11,6 +11,7 @@
+ #include "llama-model.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
++#include "llama-moe-paging.h"
+ #include "llama.h"
+ 
+ #include <cinttypes>
+@@ -92,6 +93,8 @@ llama_context::llama_context(
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+ 
++    llama_moe_paging_init(model);
++
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0b3bab6..2a283e2 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -5,6 +5,7 @@
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
++#include "llama-moe-paging.h"
+ 
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+@@ -2028,6 +2029,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
++    // optional CPU demand paging of routed experts (decode only)
++    llama_moe_paging_layer * moe_page = nullptr;
++    if (il >= 0 && n_tokens == 1 && llama_moe_paging_enabled() &&
++            up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr) {
++        moe_page = llama_moe_paging_layer_for(il);
++    }
++    if (moe_page != nullptr) {
++        up_exps      = moe_page->stage_up;
++        gate_exps    = moe_page->stage_gate;
++        down_exps    = moe_page->stage_down;
++        gate_up_exps = nullptr;
++    }
++
+     ggml_tensor * logits = nullptr;
+ 
+     if (probs_in == nullptr) {
+@@ -2132,6 +2146,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+     cb(weights, "ffn_moe_weights", il);
+ 
++    if (moe_page != nullptr) {
++        // page the K selected experts into the K-slot staging tensors and remap ids
++        selected_experts = ggml_map_custom1(ctx0, selected_experts, llama_moe_paging_stage, 1, moe_page);
++        cb(selected_experts, "ffn_moe_topk_slot", il);
++    }
++
+ 
+     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+@@ -2331,6 +2351,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(experts, "ffn_moe_weighted", il);
+     }
+ 
++    if (moe_page != nullptr && llama_moe_paging_timing_enabled()) {
++        // side marker: timestamp the end of the expert compute without altering the graph
++        ggml_tensor * moe_end = ggml_map_custom1_inplace(ctx0, experts, llama_moe_paging_end, 1, moe_page);
++        cb(moe_end, "ffn_moe_end", il);
++        ggml_build_forward_expand(gf, moe_end);
++    }
++
+     ggml_build_forward_expand(gf, experts);
+ 
+     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 43c396f..57275d8 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1240,6 +1240,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                         // when overriding to a CPU buffer, consider the extra buffer types
+                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
++                        // demand paging reads routed experts from the packed store: keep them
++                        // file-backed instead of copying the whole pool into a CPU_REPACK buffer
++                        static const bool force_mmap_experts =
++                            (getenv("LLAMA_MOE_PAGING_M") != nullptr && atoi(getenv("LLAMA_MOE_PAGING_M")) > 0) ||
++                            (getenv("LLAMA_MOE_EXPERTS_MMAP") != nullptr && atoi(getenv("LLAMA_MOE_EXPERTS_MMAP")) > 0);
++                        if (force_mmap_experts && use_mmap && tensor_name.find("_exps") != std::string::npos) {
++                            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++                            if (cpu_dev != nullptr) {
++                                buft = ggml_backend_dev_buffer_type(cpu_dev);
++                            }
++                        }
+                         if (use_mmap) {
+                             static std::once_flag once;
+                             std::call_once(once, [] {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 905b0a6..1e54a5e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1799,7 +1799,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // disable bulk mmap prefetch when routed-expert demand paging is on
++    const bool moe_paging = getenv("LLAMA_MOE_PAGING_M") != nullptr && atoi(getenv("LLAMA_MOE_PAGING_M")) > 0;
++    ml.init_mappings(!moe_paging, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+diff --git a/src/llama-moe-paging.cpp b/src/llama-moe-paging.cpp
+new file mode 100644
+index 0000000..1175fa5
+--- /dev/null
++++ b/src/llama-moe-paging.cpp
+@@ -0,0 +1,845 @@
++#include "llama-moe-paging.h"
++
++#include "llama-impl.h"
++#include "llama-model.h"
++
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cmath>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <fcntl.h>
++#include <mutex>
++#include <string>
++#include <sys/stat.h>
++#include <thread>
++#include <unistd.h>
++#include <vector>
++
++namespace {
++
++constexpr int    HIST_BUCKETS = 32;
++constexpr double HIST_LO_MS   = 0.01;
++constexpr int    MAX_READ_COMPONENTS = 3;
++constexpr int    MAX_K        = 64;
++
++static double hist_percentile(const uint64_t * hist, double q) {
++    uint64_t total = 0;
++    for (int b = 0; b < HIST_BUCKETS; b++) {
++        total += hist[b];
++    }
++    if (total == 0) {
++        return 0.0;
++    }
++    const double target = q * (double) total;
++    uint64_t cum = 0;
++    for (int b = 0; b < HIST_BUCKETS; b++) {
++        cum += hist[b];
++        if ((double) cum >= target) {
++            return HIST_LO_MS * (double) (1ULL << (b + 1));
++        }
++    }
++    return HIST_LO_MS * (double) (1ULL << HIST_BUCKETS);
++}
++
++static void hist_add(uint64_t * hist, double dt) {
++    int b = dt > HIST_LO_MS ? (int) std::floor(std::log2(dt / HIST_LO_MS)) : 0;
++    if (b < 0) { b = 0; }
++    if (b >= HIST_BUCKETS) { b = HIST_BUCKETS - 1; }
++    hist[b]++;
++}
++
++enum read_kind {
++    READ_PACKED = 0,
++    READ_GATE,
++    READ_UP,
++    READ_DOWN,
++};
++
++struct read_batch {
++    std::atomic<int>  remaining {0};
++    std::atomic<bool> failed {false};
++    std::mutex m;
++    std::condition_variable cv;
++};
++
++struct io_task {
++    llama_moe_paging_layer * layer = nullptr;
++    read_batch * batch = nullptr;
++    int32_t gid  = -1;
++    int32_t slot = -1;
++    int     kind = READ_PACKED;
++    int64_t offset = 0;
++    size_t  size = 0;
++    size_t  dst  = 0;
++};
++
++struct paging_state {
++    bool enabled = false;
++    bool initialized = false;
++    int  n_layer = 0;
++    int  n_expert = 0;
++    int  m_slots = 0;
++    int  k_slots = 0;
++    int64_t record_stride = 0;
++    std::string policy;      // lru | event_decay90
++    std::string backend;     // packed | gguf3
++    std::string stats_path;
++    int  qd = 4;
++    bool hot = false;
++    bool nocache_requested = false;
++    bool nocache_applied = false;
++    bool assert_checks = false;
++    bool timing = true;
++
++    int store_fd = -1;
++    int gguf_fd  = -1;
++
++    ggml_backend_t cpu = nullptr;
++    std::vector<llama_moe_paging_layer> layers;
++    std::vector<uint8_t> hot_src;
++
++    uint64_t clock = 0;
++    uint64_t tokens = 0;
++    int      stats_interval = 128;
++    uint64_t last_flush_tokens = 0;
++    int      fault_after = 0;
++    std::atomic<int> reads_done {0};
++    uint64_t hot_fills = 0;
++
++    // global read latency and read-set histograms
++    std::mutex hist_m;
++    uint64_t hist[HIST_BUCKETS]        = {};
++    uint64_t readset_hist[HIST_BUCKETS] = {};
++
++    // worker pool
++    std::mutex mtx;
++    std::condition_variable cv_task;
++    std::deque<io_task> queue;
++    bool stopping = false;
++    std::vector<std::thread> workers;
++};
++
++paging_state g;
++
++int getenv_int(const char * name, int fallback) {
++    const char * v = getenv(name);
++    if (v == nullptr || v[0] == '\0') {
++        return fallback;
++    }
++    return atoi(v);
++}
++
++bool getenv_bool(const char * name, bool fallback) {
++    const char * v = getenv(name);
++    if (v == nullptr || v[0] == '\0') {
++        return fallback;
++    }
++    return atoi(v) != 0;
++}
++
++std::string getenv_str(const char * name, const char * fallback) {
++    const char * v = getenv(name);
++    return (v != nullptr && v[0] != '\0') ? std::string(v) : std::string(fallback);
++}
++
++int64_t align_up(int64_t v, int64_t a) {
++    return (v + a - 1) & ~(a - 1);
++}
++
++double now_ms() {
++    using clk = std::chrono::steady_clock;
++    return std::chrono::duration<double, std::milli>(clk::now().time_since_epoch()).count();
++}
++
++// Exact read at off into dst. False on EOF, error, or injected fault.
++bool read_exact(int fd, void * buf, size_t n, off_t off) {
++    if (g.fault_after > 0 && g.reads_done.load() >= g.fault_after) {
++        return false;
++    }
++    size_t done = 0;
++    uint8_t * p = (uint8_t *) buf;
++    while (done < n) {
++        const ssize_t r = pread(fd, p + done, n - done, off + (off_t) done);
++        if (r < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return false;
++        }
++        if (r == 0) {
++            return false;
++        }
++        done += (size_t) r;
++    }
++    g.reads_done.fetch_add(1);
++    return true;
++}
++
++void run_one_task(const io_task & t) {
++    int fd = g.backend == "gguf3" ? g.gguf_fd : g.store_fd;
++    uint8_t * buf = t.layer->cache.data() + (size_t) t.slot * (size_t) g.record_stride + t.dst;
++    const double t0 = now_ms();
++    const bool ok = read_exact(fd, buf, t.size, (off_t) t.offset);
++    const double dt = now_ms() - t0;
++    {
++        std::lock_guard<std::mutex> lk(g.hist_m);
++        hist_add(g.hist, dt);
++    }
++    read_batch * b = t.batch;
++    if (b != nullptr) {
++        std::lock_guard<std::mutex> lk(b->m);
++        if (!ok) {
++            b->failed.store(true);
++        }
++        if (--b->remaining == 0) {
++            b->cv.notify_all();
++        }
++    }
++}
++
++void worker_main() {
++    for (;;) {
++        io_task t;
++        {
++            std::unique_lock<std::mutex> lk(g.mtx);
++            g.cv_task.wait(lk, [] { return g.stopping || !g.queue.empty(); });
++            if (g.queue.empty()) {
++                if (g.stopping) {
++                    return;
++                }
++                continue;
++            }
++            t = g.queue.front();
++            g.queue.pop_front();
++        }
++        run_one_task(t);
++    }
++}
++
++// Returns false if any read failed.
++bool run_read_tasks(const std::vector<io_task> & tasks) {
++    if (tasks.empty()) {
++        return true;
++    }
++    if (g.workers.empty()) {
++        for (const auto & t : tasks) {
++            int fd = g.backend == "gguf3" ? g.gguf_fd : g.store_fd;
++            uint8_t * buf = t.layer->cache.data() + (size_t) t.slot * (size_t) g.record_stride + t.dst;
++            const double t0 = now_ms();
++            const bool ok = read_exact(fd, buf, t.size, (off_t) t.offset);
++            hist_add(g.hist, now_ms() - t0);
++            if (!ok) {
++                return false;
++            }
++        }
++        return true;
++    }
++    read_batch batch;
++    batch.remaining.store((int) tasks.size());
++    {
++        std::lock_guard<std::mutex> lk(g.mtx);
++        for (const auto & t : tasks) {
++            io_task copy = t;
++            copy.batch = &batch;
++            g.queue.push_back(copy);
++        }
++    }
++    g.cv_task.notify_all();
++    {
++        std::unique_lock<std::mutex> lk(batch.m);
++        batch.cv.wait(lk, [&] { return batch.remaining.load() == 0; });
++    }
++    return !batch.failed.load();
++}
++
++void pool_stop() {
++    if (g.workers.empty()) {
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lk(g.mtx);
++        g.stopping = true;
++    }
++    g.cv_task.notify_all();
++    for (auto & w : g.workers) {
++        if (w.joinable()) {
++            w.join();
++        }
++    }
++    g.workers.clear();
++}
++
++void dump_stats() {
++    if (!g.enabled) {
++        return;
++    }
++    FILE * f = fopen(g.stats_path.c_str(), "w");
++    if (f == nullptr) {
++        return;
++    }
++    uint64_t hits = 0, misses = 0, evict = 0, bytes = 0, stage_bytes = 0, events = 0;
++    double fault_ms = 0.0, stage_ms = 0.0, compute_ms = 0.0;
++    uint64_t miss_hist[9] = {};
++    uint64_t readset_hist[HIST_BUCKETS];
++    {
++        std::lock_guard<std::mutex> lk(g.hist_m);
++        std::copy(g.readset_hist, g.readset_hist + HIST_BUCKETS, readset_hist);
++    }
++    for (const auto & l : g.layers) {
++        hits += l.hits; misses += l.misses; evict += l.evictions;
++        bytes += l.bytes_read; stage_bytes += l.stage_bytes; events += l.events;
++        fault_ms += l.fault_ms; stage_ms += l.stage_ms; compute_ms += l.compute_ms;
++        for (int k = 0; k < 9; k++) {
++            miss_hist[k] += l.miss_hist[k];
++        }
++    }
++    const uint64_t qd_max = g.layers.empty() ? 0 : [&] {
++        uint64_t m = 0;
++        for (const auto & l : g.layers) { m = std::max(m, l.qd_max); }
++        return m;
++    }();
++    uint64_t qd_sum = 0;
++    for (const auto & l : g.layers) { qd_sum += l.qd_sum; }
++
++    fprintf(f, "{\n");
++    fprintf(f, " \"mode\": \"cpu_hybrid_staging_paging\",\n");
++    fprintf(f, " \"backend\": \"%s\",\n", g.backend.c_str());
++    fprintf(f, " \"qd\": %d,\n", g.qd);
++    fprintf(f, " \"hot\": %s,\n", g.hot ? "true" : "false");
++    fprintf(f, " \"nocache_requested\": %s,\n", g.nocache_requested ? "true" : "false");
++    fprintf(f, " \"nocache_applied\": %s,\n", g.nocache_applied ? "true" : "false");
++    fprintf(f, " \"slots_per_layer\": %d,\n", g.m_slots);
++    fprintf(f, " \"staging_slots\": %d,\n", g.k_slots);
++    fprintf(f, " \"n_layer\": %d,\n", g.n_layer);
++    fprintf(f, " \"n_expert\": %d,\n", g.n_expert);
++    fprintf(f, " \"record_stride\": %lld,\n", (long long) g.record_stride);
++    fprintf(f, " \"policy\": \"%s\",\n", g.policy.c_str());
++    fprintf(f, " \"decode_tokens_observed\": %llu,\n", (unsigned long long) g.tokens);
++    fprintf(f, " \"hits\": %llu,\n", (unsigned long long) hits);
++    fprintf(f, " \"misses\": %llu,\n", (unsigned long long) misses);
++    fprintf(f, " \"evictions\": %llu,\n", (unsigned long long) evict);
++    fprintf(f, " \"hot_fills\": %llu,\n", (unsigned long long) g.hot_fills);
++    fprintf(f, " \"hit_rate\": %.6f,\n", (hits + misses) ? double(hits) / double(hits + misses) : 0.0);
++    fprintf(f, " \"bytes_read\": %llu,\n", (unsigned long long) bytes);
++    fprintf(f, " \"stage_bytes\": %llu,\n", (unsigned long long) stage_bytes);
++    fprintf(f, " \"fault_ms\": %.3f,\n", fault_ms);
++    fprintf(f, " \"stage_ms\": %.3f,\n", stage_ms);
++    fprintf(f, " \"compute_ms\": %.3f,\n", compute_ms);
++    fprintf(f, " \"layer_events\": %llu,\n", (unsigned long long) events);
++    fprintf(f, " \"qd_max\": %llu,\n", (unsigned long long) qd_max);
++    fprintf(f, " \"qd_sum\": %llu,\n", (unsigned long long) qd_sum);
++    fprintf(f, " \"read_ms_p50\": %.3f,\n", hist_percentile(g.hist, 0.50));
++    fprintf(f, " \"read_ms_p95\": %.3f,\n", hist_percentile(g.hist, 0.95));
++    fprintf(f, " \"read_ms_p99\": %.3f,\n", hist_percentile(g.hist, 0.99));
++    fprintf(f, " \"read_ms_histogram\": [");
++    for (int b = 0; b < HIST_BUCKETS; b++) {
++        fprintf(f, "%s%llu", b ? ", " : "", (unsigned long long) g.hist[b]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"readset_ms_p50\": %.3f,\n", hist_percentile(readset_hist, 0.50));
++    fprintf(f, " \"readset_ms_p95\": %.3f,\n", hist_percentile(readset_hist, 0.95));
++    fprintf(f, " \"readset_ms_histogram\": [");
++    for (int b = 0; b < HIST_BUCKETS; b++) {
++        fprintf(f, "%s%llu", b ? ", " : "", (unsigned long long) readset_hist[b]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"layer_miss_hist\": [");
++    for (int k = 0; k < 9; k++) {
++        fprintf(f, "%s%llu", k ? ", " : "", (unsigned long long) miss_hist[k]);
++    }
++    fprintf(f, "],\n");
++    fprintf(f, " \"per_layer\": [\n");
++    for (size_t i = 0; i < g.layers.size(); i++) {
++        const auto & l = g.layers[i];
++        if (l.il < 0) {
++            continue;
++        }
++        fprintf(f, "  {\"layer\": %d, \"hits\": %llu, \"misses\": %llu, \"evictions\": %llu, "
++                   "\"bytes_read\": %llu, \"fault_ms\": %.3f, \"stage_ms\": %.3f, \"compute_ms\": %.3f, "
++                   "\"events\": %llu, \"readset_p50_ms\": %.3f, \"readset_p95_ms\": %.3f, "
++                   "\"miss_hist\": [",
++                l.il, (unsigned long long) l.hits, (unsigned long long) l.misses,
++                (unsigned long long) l.evictions, (unsigned long long) l.bytes_read,
++                l.fault_ms, l.stage_ms, l.compute_ms, (unsigned long long) l.events,
++                hist_percentile(l.readset_hist, 0.50), hist_percentile(l.readset_hist, 0.95));
++        for (int k = 0; k < 9; k++) {
++            fprintf(f, "%s%llu", k ? ", " : "", (unsigned long long) l.miss_hist[k]);
++        }
++        fprintf(f, "]}%s\n", i + 1 < g.layers.size() ? "," : "");
++    }
++    fprintf(f, " ]\n}\n");
++    fclose(f);
++}
++
++void atexit_handler() {
++    pool_stop();
++    dump_stats();
++}
++
++void build_read_tasks(llama_moe_paging_layer & l, int32_t gid, int32_t slot, std::vector<io_task> & tasks) {
++    if (g.backend == "gguf3") {
++        io_task a; a.layer = &l; a.gid = gid; a.slot = slot; a.kind = READ_GATE;
++        a.offset = l.gguf_gate_off + (int64_t) gid * l.gate_bytes;
++        a.size = (size_t) l.gate_bytes; a.dst = (size_t) l.gate_off;
++        tasks.push_back(a);
++        io_task b = a; b.kind = READ_UP;
++        b.offset = l.gguf_up_off + (int64_t) gid * l.up_bytes;
++        b.size = (size_t) l.up_bytes; b.dst = (size_t) l.up_off;
++        tasks.push_back(b);
++        io_task c = a; c.kind = READ_DOWN;
++        c.offset = l.gguf_down_off + (int64_t) gid * l.down_bytes;
++        c.size = (size_t) l.down_bytes; c.dst = (size_t) l.down_off;
++        tasks.push_back(c);
++    } else {
++        io_task a;
++        a.layer = &l; a.gid = gid; a.slot = slot; a.kind = READ_PACKED;
++        a.offset = ((int64_t) l.il * g.n_expert + gid) * g.record_stride;
++        a.size = (size_t) g.record_stride; a.dst = 0;
++        tasks.push_back(a);
++    }
++}
++
++int find_slot(const llama_moe_paging_layer & l, int32_t gid) {
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.slot_expert[s] == gid) {
++            return s;
++        }
++    }
++    return -1;
++}
++
++int pick_victim(const llama_moe_paging_layer & l) {
++    int slot = -1;
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.reserved[s]) {
++            continue;
++        }
++        if (l.slot_expert[s] < 0) {
++            slot = s;
++            break;
++        }
++    }
++    if (slot >= 0) {
++        return slot;
++    }
++    const bool decay = g.policy == "event_decay90";
++    for (int s = 0; s < l.n_slots; s++) {
++        if (l.reserved[s]) {
++            continue;
++        }
++        if (slot < 0) {
++            slot = s;
++            continue;
++        }
++        const bool better = decay ? (l.score[s] < l.score[slot]) : (l.last_use[s] < l.last_use[slot]);
++        if (better) {
++            slot = s;
++        }
++    }
++    return slot;
++}
++
++void stage_event(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
++    const bool decay = g.policy == "event_decay90";
++
++    // event-decay90: one decay of every resident score per layer event
++    if (decay) {
++        for (int s = 0; s < l.n_slots; s++) {
++            l.score[s] *= 0.90;
++        }
++    }
++
++    std::fill(l.reserved.begin(), l.reserved.end(), (uint8_t) 0);
++
++    int32_t cache_slot[MAX_K];
++    int     miss_i[MAX_K];
++    int     n_miss = 0;
++
++    for (int i = 0; i < k; i++) {
++        cache_slot[i] = find_slot(l, req[i]);
++        if (cache_slot[i] >= 0) {
++            l.hits++;
++            l.last_use[cache_slot[i]] = ++g.clock;
++            l.reserved[cache_slot[i]] = 1; // never evict an expert required by this event
++            if (decay) {
++                l.score[cache_slot[i]] += 1.0;
++            }
++        } else {
++            miss_i[n_miss++] = i;
++        }
++    }
++
++    // reserve one distinct cache slot per miss before any read starts
++    for (int m = 0; m < n_miss; m++) {
++        const int s = pick_victim(l);
++        if (s < 0) {
++            GGML_ABORT("moe paging: no victim slot available (M=%d, misses=%d)", l.n_slots, n_miss);
++        }
++        if (l.slot_expert[s] >= 0) {
++            l.evictions++;
++        }
++        l.reserved[s] = 1;
++        cache_slot[miss_i[m]] = s;
++    }
++
++    // gather the read set for all misses
++    std::vector<io_task> tasks;
++    tasks.reserve((size_t) n_miss * (g.backend == "gguf3" ? MAX_READ_COMPONENTS : 1));
++    for (int m = 0; m < n_miss; m++) {
++        const int i = miss_i[m];
++        const int s = cache_slot[i];
++        if (g.hot) {
++            // compute-only control: no file I/O, fill from a synthetic buffer
++            memcpy(l.cache.data() + (size_t) s * (size_t) g.record_stride,
++                   g.hot_src.data(), (size_t) g.record_stride);
++            g.hot_fills++;
++        } else {
++            build_read_tasks(l, req[i], s, tasks);
++        }
++    }
++
++    const int ntasks = (int) tasks.size();
++    const uint64_t eff_qd = ntasks > 0
++        ? (uint64_t) std::min<int>((int) std::max<size_t>(g.workers.size(), 1), ntasks)
++        : 0;
++    l.qd_sum += eff_qd;
++    l.qd_max = std::max(l.qd_max, eff_qd);
++
++    if (!tasks.empty()) {
++        const double t0 = now_ms();
++        const bool ok = run_read_tasks(tasks);
++        const double dt = now_ms() - t0;
++        l.fault_ms += dt;
++        {
++            std::lock_guard<std::mutex> lk(g.hist_m);
++            hist_add(g.readset_hist, dt);
++        }
++        hist_add(l.readset_hist, dt);
++        if (!ok) {
++            LLAMA_LOG_ERROR("%s: cannot read the full expert read set (layer %d, %d reads)\n",
++                            __func__, l.il, ntasks);
++            GGML_ABORT("moe paging: incomplete expert read set; refusing to run with partial weights");
++        }
++    }
++
++    // publish cache metadata only after every exact read succeeded
++    for (int m = 0; m < n_miss; m++) {
++        const int i = miss_i[m];
++        const int s = cache_slot[i];
++        l.slot_expert[s] = req[i];
++        l.last_use[s] = ++g.clock;
++        l.score[s] = decay ? 1.0 : 0.0;
++        l.misses++;
++        if (!g.hot) {
++            l.bytes_read += (uint64_t) g.record_stride;
++        }
++    }
++    l.miss_hist[std::min(n_miss, 8)]++;
++    l.events++;
++
++    // Stage in ascending cache-slot order. mul_mat_id accumulates expert
++    // contributions in slot order, so this reproduces the Execution 003 CPU
++    // accumulation order and keeps the compute shape at K.
++    int order[MAX_K];
++    for (int i = 0; i < k; i++) {
++        order[i] = i;
++    }
++    std::sort(order, order + k, [&](int a, int b) { return cache_slot[a] < cache_slot[b]; });
++
++    const double ts0 = now_ms();
++    for (int j = 0; j < k; j++) {
++        const int i = order[j];
++        const int s = cache_slot[i];
++        const uint8_t * rec = l.cache.data() + (size_t) s * (size_t) g.record_stride;
++        memcpy((uint8_t *) l.stage_gate->data + (size_t) j * (size_t) l.gate_bytes, rec + l.gate_off, (size_t) l.gate_bytes);
++        memcpy((uint8_t *) l.stage_up->data   + (size_t) j * (size_t) l.up_bytes,   rec + l.up_off,   (size_t) l.up_bytes);
++        memcpy((uint8_t *) l.stage_down->data + (size_t) j * (size_t) l.down_bytes, rec + l.down_off, (size_t) l.down_bytes);
++        out_slot[i] = j;
++    }
++    l.stage_ms += now_ms() - ts0;
++    l.stage_bytes += (uint64_t) k * (uint64_t) g.record_stride;
++    l.compute_start_ms = now_ms();
++
++    if (g.assert_checks) {
++        bool seen[MAX_K] = {};
++        for (int i = 0; i < k; i++) {
++            const int s = cache_slot[i];
++            if (!(s >= 0 && s < l.n_slots)) {
++                GGML_ABORT("moe paging assert: cache slot %d out of range", s);
++            }
++            if (l.slot_expert[s] != req[i]) {
++                GGML_ABORT("moe paging assert: slot %d holds expert %d, expected %d",
++                           s, l.slot_expert[s], req[i]);
++            }
++            for (int j = 0; j < i; j++) {
++                if (cache_slot[j] == s) {
++                    GGML_ABORT("moe paging assert: cache slot %d assigned twice", s);
++                }
++            }
++            GGML_UNUSED(seen);
++        }
++    }
++}
++
++} // namespace
++
++void llama_moe_paging_init(const llama_model & model) {
++    if (g.initialized) {
++        return;
++    }
++    g.initialized = true;
++
++    const int m = getenv_int("LLAMA_MOE_PAGING_M", 0);
++    if (m <= 0) {
++        return;
++    }
++    if (model.hparams.n_layer() <= 0 || model.hparams.n_expert <= 0) {
++        return;
++    }
++
++    g.n_layer  = (int) model.hparams.n_layer();
++    g.n_expert = (int) model.hparams.n_expert;
++    g.m_slots  = m;
++    const uint32_t k = model.hparams.n_expert_used_max();
++    if (k == 0 || (int) k > MAX_K) {
++        LLAMA_LOG_WARN("%s: unsupported n_expert_used=%u, paging disabled\n", __func__, k);
++        return;
++    }
++    g.k_slots = (int) k;
++    g.policy  = getenv_str("LLAMA_MOE_PAGING_POLICY", "lru");
++    if (g.policy == "decay90") {
++        g.policy = "event_decay90";
++    }
++    g.backend = getenv_str("LLAMA_MOE_PAGING_BACKEND", "packed");
++    g.qd      = std::max(1, std::min(16, getenv_int("LLAMA_MOE_PAGING_QD", 4)));
++    g.hot     = getenv_bool("LLAMA_MOE_PAGING_HOT", false);
++    g.nocache_requested = getenv_bool("LLAMA_MOE_PAGING_NOCACHE", false);
++    g.assert_checks = getenv_bool("LLAMA_MOE_PAGING_ASSERT", false);
++    g.timing = getenv_bool("LLAMA_MOE_PAGING_TIMING", true);
++    g.stats_path = getenv_str("LLAMA_MOE_PAGING_STATS", "results/moe_paging_stats.json");
++    g.stats_interval = getenv_int("LLAMA_MOE_PAGING_STATS_INTERVAL", 128);
++    g.fault_after = getenv_int("LLAMA_MOE_PAGING_FAULT_AFTER", 0);
++
++    const std::string store = getenv_str("LLAMA_MOE_PAGING_STORE", "cold-experts.bin");
++    if (g.backend != "gguf3") {
++        g.store_fd = open(store.c_str(), O_RDONLY);
++        if (g.store_fd < 0) {
++            LLAMA_LOG_WARN("%s: cannot open packed store '%s', paging disabled\n", __func__, store.c_str());
++            return;
++        }
++    }
++
++    if (g.backend == "gguf3") {
++        const std::string gguf = getenv_str("LLAMA_MOE_PAGING_GGUF", "");
++        if (gguf.empty()) {
++            GGML_ABORT("moe paging: backend=gguf3 requires LLAMA_MOE_PAGING_GGUF");
++        }
++        g.gguf_fd = open(gguf.c_str(), O_RDONLY);
++        if (g.gguf_fd < 0) {
++            GGML_ABORT("moe paging: cannot open source GGUF '%s'", gguf.c_str());
++        }
++    }
++
++    if (g.nocache_requested) {
++        bool any = false;
++#ifdef F_NOCACHE
++        if (g.store_fd >= 0 && fcntl(g.store_fd, F_NOCACHE, 1) == 0) { any = true; }
++        if (g.gguf_fd  >= 0 && fcntl(g.gguf_fd,  F_NOCACHE, 1) == 0) { any = true; }
++#endif
++        g.nocache_applied = any;
++    }
++
++    g.cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    if (g.cpu == nullptr) {
++        LLAMA_LOG_WARN("%s: no CPU backend, paging disabled\n", __func__);
++        return;
++    }
++
++    g.layers.assign(g.n_layer, llama_moe_paging_layer());
++
++    const auto * gate0 = model.layers[0].ffn_gate_exps;
++    const auto * up0   = model.layers[0].ffn_up_exps;
++    const auto * down0 = model.layers[0].ffn_down_exps;
++    if (gate0 == nullptr || up0 == nullptr || down0 == nullptr) {
++        LLAMA_LOG_WARN("%s: routed expert tensors not found, paging disabled\n", __func__);
++        return;
++    }
++
++    const int64_t gate_bytes = ggml_nbytes(gate0) / g.n_expert;
++    const int64_t up_bytes   = ggml_nbytes(up0)   / g.n_expert;
++    const int64_t down_bytes = ggml_nbytes(down0) / g.n_expert;
++    const int64_t gate_off = 0;
++    const int64_t up_off   = align_up(gate_bytes, 16);
++    const int64_t down_off = up_off + align_up(up_bytes, 16);
++    g.record_stride = align_up(down_off + align_up(down_bytes, 16), 4096);
++
++    // per-layer GGUF offsets for backend=gguf3
++    std::vector<int64_t> gguf_gate(g.n_layer, 0), gguf_up(g.n_layer, 0), gguf_down(g.n_layer, 0);
++    if (g.backend == "gguf3") {
++        const std::string csv = getenv_str("LLAMA_MOE_PAGING_OFFSETS", "results/gguf_expert_offsets.csv");
++        FILE * cf = fopen(csv.c_str(), "r");
++        if (cf == nullptr) {
++            GGML_ABORT("moe paging: cannot open gguf offset table '%s'", csv.c_str());
++        }
++        char line[512];
++        int matched = 0;
++        while (fgets(line, sizeof(line), cf) != nullptr) {
++            int il = -1;
++            long long ga = 0, gb = 0, ua = 0, ub = 0, da = 0, dbb = 0;
++            if (sscanf(line, "%d,%lld,%lld,%lld,%lld,%lld,%lld", &il, &ga, &gb, &ua, &ub, &da, &dbb) == 7) {
++                if (il >= 0 && il < g.n_layer) {
++                    gguf_gate[il] = ga;
++                    gguf_up[il]   = ua;
++                    gguf_down[il] = da;
++                    matched++;
++                }
++            }
++        }
++        fclose(cf);
++        if (matched < g.n_layer) {
++            GGML_ABORT("moe paging: offset table has %d/%d rows", matched, g.n_layer);
++        }
++    }
++
++    if (g.backend != "gguf3") {
++        struct stat st;
++        if (fstat(g.store_fd, &st) != 0) {
++            GGML_ABORT("moe paging: cannot stat packed expert store");
++        }
++        const int64_t store_need = (int64_t) g.n_layer * g.n_expert * g.record_stride;
++        if ((int64_t) st.st_size < store_need) {
++            GGML_ABORT("moe paging: packed expert store is smaller than the required expert pool");
++        }
++    }
++
++    g.hot_src.assign((size_t) g.record_stride, (uint8_t) 0x11);
++
++    const int64_t stage_bytes_per_layer = (int64_t) g.k_slots * g.record_stride;
++    for (int il = 0; il < g.n_layer; il++) {
++        auto & l = g.layers[il];
++        auto * gt = model.layers[il].ffn_gate_exps;
++        auto * ut = model.layers[il].ffn_up_exps;
++        auto * dt = model.layers[il].ffn_down_exps;
++        if (gt == nullptr || ut == nullptr || dt == nullptr) {
++            continue;
++        }
++
++        const size_t mem = 4096 + 8 * ggml_tensor_overhead();
++        ggml_init_params ip = { mem, nullptr, true };
++        l.stage_ctx = ggml_init(ip);
++        l.stage_gate = ggml_new_tensor_3d(l.stage_ctx, gt->type, gt->ne[0], gt->ne[1], g.k_slots);
++        l.stage_up   = ggml_new_tensor_3d(l.stage_ctx, ut->type, ut->ne[0], ut->ne[1], g.k_slots);
++        l.stage_down = ggml_new_tensor_3d(l.stage_ctx, dt->type, dt->ne[0], dt->ne[1], g.k_slots);
++        l.stage_buf = ggml_backend_alloc_ctx_tensors(l.stage_ctx, g.cpu);
++        if (l.stage_buf == nullptr) {
++            LLAMA_LOG_WARN("%s: failed to allocate staging buffer layer %d\n", __func__, il);
++            return;
++        }
++
++        l.il = il;
++        l.gate_bytes = gate_bytes;
++        l.up_bytes   = up_bytes;
++        l.down_bytes = down_bytes;
++        l.gate_off = gate_off;
++        l.up_off   = up_off;
++        l.down_off = down_off;
++        l.gguf_gate_off = gguf_gate[il];
++        l.gguf_up_off   = gguf_up[il];
++        l.gguf_down_off = gguf_down[il];
++        l.n_slots = g.m_slots;
++        l.slot_expert.assign(g.m_slots, -1);
++        l.last_use.assign(g.m_slots, 0);
++        l.score.assign(g.m_slots, 0.0);
++        l.reserved.assign(g.m_slots, 0);
++        l.cache.assign((size_t) g.m_slots * (size_t) g.record_stride, 0);
++        std::fill(l.miss_hist, l.miss_hist + 9, 0);
++        std::fill(l.readset_hist, l.readset_hist + HIST_BUCKETS, 0);
++
++        if (stage_bytes_per_layer <= 0) {
++            GGML_ABORT("moe paging: invalid staging size");
++        }
++    }
++
++    // bounded reusable worker pool; qd == 1 stays on the calling thread
++    if (g.qd > 1) {
++        for (int i = 0; i < g.qd; i++) {
++            g.workers.emplace_back(worker_main);
++        }
++    }
++
++    g.enabled = true;
++    std::atexit(atexit_handler);
++    dump_stats();
++    LLAMA_LOG_INFO("%s: CPU staging paging enabled: M=%d K=%d backend=%s qd=%d hot=%d nocache=%d store=%s\n",
++                   __func__, g.m_slots, g.k_slots, g.backend.c_str(), g.qd,
++                   g.hot ? 1 : 0, g.nocache_applied ? 1 : 0, store.c_str());
++}
++
++bool llama_moe_paging_enabled() {
++    return g.enabled;
++}
++
++bool llama_moe_paging_timing_enabled() {
++    return g.timing;
++}
++
++llama_moe_paging_layer * llama_moe_paging_layer_for(int il) {
++    if (!g.enabled || il < 0 || il >= (int) g.layers.size()) {
++        return nullptr;
++    }
++    llama_moe_paging_layer * l = &g.layers[il];
++    return l->stage_gate != nullptr ? l : nullptr;
++}
++
++void llama_moe_paging_stage(ggml_tensor * dst, const ggml_tensor * a,
++                            int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    GGML_UNUSED(nth);
++    auto * l = (llama_moe_paging_layer *) userdata;
++    const int64_t k = a->ne[0];
++    const int64_t n_tok = a->ne[1];
++    if (k <= 0 || k > MAX_K) {
++        GGML_ABORT("moe paging: unsupported n_expert_used=%lld", (long long) k);
++    }
++    for (int64_t t = 0; t < n_tok; t++) {
++        int32_t req[MAX_K];
++        int32_t slot[MAX_K];
++        for (int64_t i = 0; i < k; i++) {
++            req[i] = *(const int32_t *) ((const char *) a->data + t * a->nb[1] + i * a->nb[0]);
++        }
++        stage_event(*l, req, (int) k, slot);
++        for (int64_t i = 0; i < k; i++) {
++            *(int32_t *) ((char *) dst->data + t * dst->nb[1] + i * dst->nb[0]) = slot[i];
++        }
++    }
++    if (l->il == g.n_layer - 1) {
++        g.tokens++;
++        if (g.stats_interval > 0 && g.tokens >= g.last_flush_tokens + (uint64_t) g.stats_interval) {
++            dump_stats();
++            g.last_flush_tokens = g.tokens;
++        }
++    }
++}
++
++void llama_moe_paging_end(ggml_tensor * dst, const ggml_tensor * a,
++                          int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    GGML_UNUSED(nth);
++    GGML_UNUSED(dst);
++    GGML_UNUSED(a);
++    auto * l = (llama_moe_paging_layer *) userdata;
++    l->compute_ms += now_ms() - l->compute_start_ms;
++}
+diff --git a/src/llama-moe-paging.h b/src/llama-moe-paging.h
+new file mode 100644
+index 0000000..68e7650
+--- /dev/null
++++ b/src/llama-moe-paging.h
+@@ -0,0 +1,112 @@
++#pragma once
++
++// Execution 004: decoupled staging + parallel cold I/O for CPU/hybrid MoE paging.
++//
++// Execution 003 coupled cache capacity M to the CPU mul_mat_id expert dimension:
++// every layer owned M-slot gate/up/down tensors, and the graph remapped global
++// expert ids to those M slots. Larger M meant more I/O hits but a slower kernel.
++//
++// This module keeps two separate objects per layer:
++//
++//   * resident cache: M raw record-layout byte slots, replaced by LRU or
++//     event-decay90; capacity M is independent of the compute shape;
++//   * staging: exactly K = n_expert_used gate/up/down tensors whose expert
++//     dimension is always K (8 for Qwen3.6-35B-A3B). The graph calls mul_mat_id
++//     on the staging tensors only, after the selected K experts are copied in.
++//
++// All misses of one layer event are gathered first and read through a bounded
++// reusable worker pool (QD 1/2/4/8). Two storage backends are supported:
++// one packed record per expert, or three component reads straight from the
++// source GGUF. Reads can be marked best-effort uncached (F_NOCACHE on macOS).
++//
++// Enabled when LLAMA_MOE_PAGING_M is set to a positive integer.
++
++#include "ggml.h"
++
++#include <cstdint>
++#include <vector>
++
++struct llama_model;
++struct ggml_context;
++typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
++
++struct llama_moe_paging_layer {
++    int il = -1;
++
++    // K = n_expert_used staging tensors, expert dimension always K
++    ggml_tensor * stage_gate = nullptr;
++    ggml_tensor * stage_up   = nullptr;
++    ggml_tensor * stage_down = nullptr;
++
++    ggml_context *        stage_ctx = nullptr;
++    ggml_backend_buffer_t stage_buf = nullptr;
++
++    // resident M-slot cache, one record-layout block per slot
++    std::vector<uint8_t> cache;
++    int n_slots = 0;
++    std::vector<int32_t>  slot_expert;  // global expert id per slot, -1 == empty
++    std::vector<uint64_t> last_use;     // per-slot recency clock
++    std::vector<double>   score;        // event-decay90 score
++    std::vector<uint8_t>  reserved;     // per event: slot is a miss destination
++
++    // component geometry inside a record
++    int64_t gate_bytes = 0;
++    int64_t up_bytes   = 0;
++    int64_t down_bytes = 0;
++    int64_t gate_off   = 0;
++    int64_t up_off     = 0;
++    int64_t down_off   = 0;
++
++    // absolute GGUF offsets for backend=gguf3
++    int64_t gguf_gate_off = 0;
++    int64_t gguf_up_off   = 0;
++    int64_t gguf_down_off = 0;
++
++    // instrumentation
++    uint64_t hits       = 0;
++    uint64_t misses     = 0;
++    uint64_t evictions  = 0;
++    uint64_t bytes_read = 0;
++    uint64_t stage_bytes = 0;
++    uint64_t events     = 0;
++    uint64_t qd_sum     = 0;
++    uint64_t qd_max     = 0;
++    uint64_t miss_hist[9] = {};   // layer events with 0..8 unique misses
++    uint64_t readset_hist[32] = {}; // read-set latency buckets for this layer
++    double   fault_ms   = 0.0;    // time waiting for the miss read set
++    double   stage_ms   = 0.0;    // cache -> staging copy
++    double   compute_ms = 0.0;    // router weights -> expert down projection
++    double   compute_start_ms = 0.0;
++};
++
++// Idempotent. Reads the env vars:
++//   LLAMA_MOE_PAGING_M        slots per layer (0 == disabled)
++//   LLAMA_MOE_PAGING_STORE    packed store path (default cold-experts.bin)
++//   LLAMA_MOE_PAGING_GGUF     source GGUF path (required by backend=gguf3)
++//   LLAMA_MOE_PAGING_OFFSETS  GGUF offset CSV (default results/gguf_expert_offsets.csv)
++//   LLAMA_MOE_PAGING_STATS    stats output path
++//   LLAMA_MOE_PAGING_POLICY   lru | event_decay90 (decay90 accepted as alias)
++//   LLAMA_MOE_PAGING_BACKEND  packed | gguf3 (default packed)
++//   LLAMA_MOE_PAGING_QD       read queue depth 1/2/4/8 (default 4)
++//   LLAMA_MOE_PAGING_NOCACHE  0|1 best-effort F_NOCACHE (default 0)
++//   LLAMA_MOE_PAGING_HOT      0|1 no-file-I/O compute control (default 0)
++//   LLAMA_MOE_PAGING_STATS_INTERVAL  tokens between stats flushes (default 128)
++//   LLAMA_MOE_PAGING_FAULT_AFTER     inject a read failure after N reads (test)
++//   LLAMA_MOE_PAGING_ASSERT   0|1 internal consistency checks (default 0)
++void llama_moe_paging_init(const llama_model & model);
++
++bool llama_moe_paging_enabled();
++
++// False when LLAMA_MOE_PAGING_TIMING=0: skips the end-of-MoE timestamp marker.
++bool llama_moe_paging_timing_enabled();
++
++llama_moe_paging_layer * llama_moe_paging_layer_for(int il);
++
++// ggml custom op: ensure the K selected global experts are resident, copy them
++// into staging, and write staging slot ids 0..K-1 to dst.
++void llama_moe_paging_stage(ggml_tensor * dst, const ggml_tensor * a,
++                            int ith, int nth, void * userdata);
++
++// ggml custom op: end-of-MoE timestamp marker (copies a to dst).
++void llama_moe_paging_end(ggml_tensor * dst, const ggml_tensor * a,
++                          int ith, int nth, void * userdata);

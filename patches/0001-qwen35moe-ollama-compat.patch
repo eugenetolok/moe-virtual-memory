@@ -1,0 +1,100 @@
+From 2a4be5d61e0d31a2c6940250874e04c0a3fe8656 Mon Sep 17 00:00:00 2001
+From: MoE PoC <moe-poc@localhost>
+Date: Sat, 26 Sep 2026 13:11:07 +0300
+Subject: [PATCH] qwen35moe: load Ollama-style Qwen3.6 GGUF
+
+- zero-pad rope.dimension_sections when the file has 3 entries
+- fall back to blk.N.ssm_dt when the .bias suffix is absent
+- use per-layer n_head_kv/n_embd_k_gqa for tensor shapes and attention
+- allow a partial tensor set (vision and MTP siblings share the file)
+
+Assisted-by: DeepSeek Harness
+---
+ src/llama-model.cpp      |  3 ++-
+ src/models/qwen35moe.cpp | 30 +++++++++++++++++++++++++++---
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ab5e744..905b0a6 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1780,7 +1780,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
+-    ml.done_getting_tensors();
++    // allow unused tensors: some GGUFs bundle a vision or MTP sibling in the same file
++    ml.done_getting_tensors(true);
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+     // If sidecar scales exist, the output weight must be an actual output tensor.
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index bdf7726..b31455a 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,12 +1,28 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include "gguf.h"
++
++#include <algorithm>
++
+ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+ 
+-    ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
++    // Some converters write only 3 mrope sections (t, h, w), as in
++    // Qwen3.6-35B-A3B. rope_sections is pre-zeroed, so read the sections that
++    // are present and leave any missing ones at zero.
++    {
++        const std::string key = ml.llm_kv(LLM_KV_ROPE_DIMENSION_SECTIONS);
++        const int64_t kid = gguf_find_key(ml.metadata, key.c_str());
++
++        uint32_t n_sections = 4;
++        if (kid >= 0 && gguf_get_kv_type(ml.metadata, kid) == GGUF_TYPE_ARRAY) {
++            n_sections = std::min<uint32_t>((uint32_t) gguf_get_arr_n(ml.metadata, kid), n_sections);
++        }
++        ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, n_sections, true);
++    }
+ 
+     // Load linear attention (gated delta net) parameters
+     ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+@@ -71,7 +87,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+ 
+         if (!hparams.is_recr(il)) {
+             // Attention layers
+-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
++            // n_head_kv may vary per layer: recurrent layers report 0 kv heads
++            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), flags);
+             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
+ 
+             // Q/K normalization for attention layers
+@@ -83,7 +100,11 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
+-            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
++            // some converters write this tensor without the "bias" suffix
++            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags | TENSOR_NOT_REQUIRED);
++            if (layer.ssm_dt == nullptr) {
++                layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,                   il), { hparams.ssm_dt_rank }, flags);
++            }
+             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
+             layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
+             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
+@@ -284,6 +305,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
++    // n_head_kv may vary per layer: recurrent layers report 0 kv heads
++    const int64_t n_head_kv = hparams.n_head_kv(il);
++
+     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
+ 
+     // Qwen3Next uses a single Q projection that outputs query + gate
+-- 
+2.50.1 (Apple Git-155)
+

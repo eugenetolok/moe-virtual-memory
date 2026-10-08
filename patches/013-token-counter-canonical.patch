@@ -1,0 +1,63 @@
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -405,8 +405,23 @@
+     }();
+     uint64_t qd_sum = 0;
+     for (const auto & l : g.layers) { qd_sum += l.qd_sum; }
+ 
++    // Canonical token accounting: layer_events counts one event per paged layer,
++    // so for a complete single-token graph stream
++    // token_events == layer_events / n_layer.
++    const uint64_t n_layer = (uint64_t) g.n_layer;
++    const uint64_t token_events = g.tokens;
++    const uint64_t token_events_derived = n_layer > 0 ? events / n_layer : 0;
++    const bool token_events_canonical_ok =
++        n_layer > 0 && (events % n_layer) == 0 && token_events_derived == token_events;
++    if (g.assert_checks && !token_events_canonical_ok) {
++        GGML_ABORT("moe paging: non-canonical token accounting: token_events=%llu "
++                   "layer_events=%llu n_layer=%llu derived=%llu",
++                   (unsigned long long) token_events, (unsigned long long) events,
++                   (unsigned long long) n_layer, (unsigned long long) token_events_derived);
++    }
++
+     fprintf(f, "{\n");
+     fprintf(f, " \"mode\": \"cpu_hybrid_staging_paging\",\n");
+     fprintf(f, " \"backend\": \"%s\",\n", g.backend.c_str());
+     fprintf(f, " \"stage_mode\": \"%s\",\n", g.stage_mode.c_str());
+@@ -420,8 +435,13 @@
+     fprintf(f, " \"n_expert\": %d,\n", g.n_expert);
+     fprintf(f, " \"record_stride\": %lld,\n", (long long) g.record_stride);
+     fprintf(f, " \"policy\": \"%s\",\n", g.policy.c_str());
+     fprintf(f, " \"decode_tokens_observed\": %llu,\n", (unsigned long long) g.tokens);
++    fprintf(f, " \"token_events\": %llu,\n", (unsigned long long) token_events);
++    fprintf(f, " \"token_events_derived\": %llu,\n", (unsigned long long) token_events_derived);
++    fprintf(f, " \"token_events_canonical_ok\": %s,\n", token_events_canonical_ok ? "true" : "false");
++    fprintf(f, " \"hot_fill_semantics\": \"%s\",\n",
++            g.hot ? "synthetic_single_record" : "exact_model_bytes");
+     fprintf(f, " \"hits\": %llu,\n", (unsigned long long) hits);
+     fprintf(f, " \"misses\": %llu,\n", (unsigned long long) misses);
+     fprintf(f, " \"evictions\": %llu,\n", (unsigned long long) evict);
+     fprintf(f, " \"hot_fills\": %llu,\n", (unsigned long long) g.hot_fills);
+@@ -1544,19 +1564,13 @@
+             }
+         }
+     }
+ 
+-    // The hook consumes the op before the CPU timing marker and the slot-count op
+-    // can run, so mirror their bookkeeping here. Only the last layer counts a token.
++    // Keep the timing mirror that the consumed op would otherwise record. Token
++    // accounting is owned by llama_moe_paging_slots, which fires once per layer
++    // event; counting here as well overcounted every direct token four times.
+     if (g.timing) {
+         l->compute_ms += now_ms() - l->compute_start_ms;
+-    }
+-    if (ith == 0 && l->il == g.n_layer - 1) {
+-        g.tokens++;
+-        if (g.stats_interval > 0 && g.tokens >= g.last_flush_tokens + (uint64_t) g.stats_interval) {
+-            dump_stats();
+-            g.last_flush_tokens = g.tokens;
+-        }
+     }
+ 
+     return true;
+ }
