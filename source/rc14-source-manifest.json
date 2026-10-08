@@ -1,0 +1,33 @@
+{
+  "upstream_sha": "81bc6b83f827df746eb129235488d325c49cae52",
+  "upstream_repo": "https://github.com/ggml-org/llama.cpp",
+  "upstream_subject": "jinja : implement sameas test (#29448)",
+  "patch_file": "patches/025-rc14-complete-native-source.patch",
+  "patch_sha256": "251680e27aee35477d9c590a5b6320969e0765f027efeffb5baa8bf94ea90b8a",
+  "private_source_commit": "d5e27e9ba6d62a16cf7caecb7d8763680223127b",
+  "rc14_recorded_paging_sha256": "61ce135641e23f6170aaaf679c6eb6314bf5194c71df63af283f7449966729e7",
+  "file_count": 21,
+  "files": {
+    "common/CMakeLists.txt": "4144a7daf002ee33e206bcfaabde6da6908938eed6c61721b269b156a1998d78",
+    "common/arg.cpp": "92b28ad49fa752c812c939f9e8e41b8ca04b935a24ea1654c451329269119a93",
+    "common/common.cpp": "f9d77454888496d442160509b7a8f24ef084b2af0c8380ebee215189a9dc7af3",
+    "common/common.h": "e2ab490436f58054c9c74dfe88bcbb93edf0a76b2b1789d2e4402e20ee42af69",
+    "common/moe-trace.cpp": "16ade4d8371d3164844335e0f4986c07430040061f3cb222e315c529fc067abf",
+    "common/moe-trace.h": "a4e90594f6292b72795ce8e7353999c88db111bbc8707ac6e18bacbc83b75c37",
+    "ggml/include/ggml-cpu.h": "a8148f663c8ad027fcb09a8d8ded01bf468352731981c82e54b6d6bc6a493334",
+    "ggml/src/ggml-cpu/ggml-cpu.c": "6b1d0baeb6dadd224ed3c8ab7b53e7e136ff457e6e4bee7d720bd5a799fc26bc",
+    "ggml/src/ggml-cpu/traits.cpp": "53c27cab2b1ea217a327afb33359572884051e7e1d08ef479d17fd0ba3a181aa",
+    "ggml/src/ggml-cpu/traits.h": "f6987fe74a65cd178128467b3f76d813795bbf9baaaf9a7974af80f088c3592b",
+    "src/CMakeLists.txt": "d96aeaac1e0a4ada920b89c4ec054c5e99c5d8018805615d39c8da02986d7c4c",
+    "src/llama-context.cpp": "a339f6cd3bf7679c8b904f4157cd93d7e204b13e1663a812f37e303432615020",
+    "src/llama-graph.cpp": "d523e1e36a706b6448a93c9ce5d62234c6167cd7c25e2457c359f0bcd2d4991e",
+    "src/llama-model-loader.cpp": "d2d866dcb898c528a3759709eacbdc2d950cbed12f711a12e8d2404bd9f4cf1e",
+    "src/llama-model.cpp": "36d7da2deb610ad83a19142eb23da6f5faf6747effb1885b266f7d7e5ede794e",
+    "src/llama-moe-observe.h": "95e2ebb83258ae1c54e0a3fb953572f34c0b9f90b11d3ca113ba67c946b3921f",
+    "src/llama-moe-paging.cpp": "61ce135641e23f6170aaaf679c6eb6314bf5194c71df63af283f7449966729e7",
+    "src/llama-moe-paging.h": "8240f18f7bd2c5b5b9e36e449e23f2f314ab62158587df8ae8d591f3e06ecbc1",
+    "src/llama-moe-tiled.cpp": "846ea065eb2b91362d1223d951b2e01a5fedfdfa0f6d4289a6d772f98905cfed",
+    "src/llama-moe-tiled.h": "3ebc26f54845ee71d9aa26076a9084e469640235aed31f0f216292172f53e95f",
+    "src/models/qwen35moe.cpp": "60c0bbbc5e95b4d088d98b107c2f8af654fa129782024c790415c9385170463e"
+  }
+}
