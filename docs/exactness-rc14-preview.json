@@ -1,0 +1,60 @@
+{
+  "execution": "025B",
+  "artifact": "moe-virtual-memory-macos-arm64-rc14 (public preview)",
+  "date_utc": "2026-10-08",
+  "host": {
+    "model": "Mac17,3",
+    "chip": "Apple M5",
+    "memory_bytes": 34359738368,
+    "macos": "26.5.1",
+    "apple_clang": "21.0.0 (clang-2100.1.1.101)"
+  },
+  "source": {
+    "upstream_sha": "81bc6b83f827df746eb129235488d325c49cae52",
+    "patch_sha256": "251680e27aee35477d9c590a5b6320969e0765f027efeffb5baa8bf94ea90b8a",
+    "rc14_paging_sha256": "61ce135641e23f6170aaaf679c6eb6314bf5194c71df63af283f7449966729e7"
+  },
+  "model": {
+    "name": "Qwen3.6-35B-A3B",
+    "bytes": 23938321664,
+    "sha256": "f5ee307a2982106a6eb82b62b2c00b575c9072145a759ae4660378acda8dcf2d",
+    "verified": true,
+    "included_in_package": false
+  },
+  "binaries": {
+    "llama-server": "076d453111a9fa038755ae600f24dd010a28749dc159d047a3961f265c52f0f9",
+    "moe-tiled-selftest": "a17ea7edfbcad0b4ae05508a18962023f28ad387a489e578590f354a7f8af1cd",
+    "moe-tiled-benchmark": "9943680d3c48e492d69d0254d92fc9e070231cee38eafc07f6f417d1c3f76245",
+    "moe-tile16-compiler": "cfe1fe40850721c86763a57c95fd564a81d75779a4c0881f44700539e21f7ae1"
+  },
+  "tests": [
+    {
+      "name": "synthetic native graph differential",
+      "binary": "moe-tiled-selftest",
+      "result": "PASS",
+      "detail": "cases=6408 op_compares=32040 masks=256 mismatches=0 ready_n=0..8 threads=1,4 geometries=256x256,2048x512 poison=yes canonical_final_order=yes"
+    },
+    {
+      "name": "real-weight production-path byte reproducibility (raw layout, reference write vs read)",
+      "binary": "moe-tiled-benchmark",
+      "result": "PASS",
+      "detail": "decode_calls=41 (25 prompt + 16 generated), observed_ops=4920, exact_tensor_events=4920, exact_tensor_bytes=161218560, mismatches=0; generated tokens and ordered routes identical"
+    },
+    {
+      "name": "real-weight raw vs tile16 byte differential",
+      "result": "NOT RUN",
+      "reason": "20.9 GB tile16 sidecar not present on the build host"
+    },
+    {
+      "name": "full 16-profile combinations matrix",
+      "result": "NOT RUN",
+      "reason": "requires the tile16 sidecar and several hours"
+    },
+    {
+      "name": "physical Apple M1 8 GB verification",
+      "result": "PENDING",
+      "reason": "maintainer will run the published archive"
+    }
+  ],
+  "stable_release_gate": "CLOSED - source/RELEASE_APPROVED.json intentionally absent"
+}

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for f in release/moe-serve release/moe-prepare-tiled release/build-rc.sh scripts/bootstrap-upstream.sh scripts/package-public.sh scripts/check-public.sh; do
+for f in release/moe-serve release/moe-prepare-tiled release/build-rc.sh release/build-tools.sh release/package-rc14.sh scripts/bootstrap-upstream.sh scripts/package-public.sh scripts/check-public.sh; do
   bash -n "$f"
 done
-python3 -m py_compile release/moe-m1-combinations
+python3 -m py_compile release/moe-m1-combinations scripts/gen-tile16-plan.py
 test -s LICENSE
 test -s THIRD_PARTY_NOTICES.md
 grep -Fxq 'MIT License' LICENSE

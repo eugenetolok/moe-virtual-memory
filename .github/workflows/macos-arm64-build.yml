@@ -1,0 +1,66 @@
+name: macOS ARM64 preview build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-arm64-preview:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Public source checks
+        run: bash scripts/check-public.sh
+
+      - name: Reconstruct pinned native source
+        run: bash scripts/bootstrap-upstream.sh
+
+      - name: Install build tools
+        run: brew install cmake ninja
+
+      - name: Build llama-server (arm64)
+        run: bash release/build-rc.sh
+
+      - name: Build native test/compiler tools (arm64)
+        run: bash release/build-tools.sh
+
+      - name: Verify executable architecture
+        run: |
+          for b in llama-server moe-tiled-selftest moe-tiled-benchmark moe-tile16-compiler; do
+            file "llama.cpp/build-m1-rc/bin/$b"
+            file "llama.cpp/build-m1-rc/bin/$b" | grep -q arm64
+          done
+
+      - name: Run synthetic native graph differential
+        run: llama.cpp/build-m1-rc/bin/moe-tiled-selftest
+
+      - name: Package self-contained preview
+        run: bash release/package-rc14.sh
+
+      - name: Verify package checksums and contents
+        run: |
+          set -euo pipefail
+          cat dist/*.sha256
+          (cd dist && shasum -a 256 -c ./*.tar.gz.sha256)
+          ARCHIVE=$(ls dist/*.tar.gz)
+          tar tzf "$ARCHIVE" | grep -q '/bin/llama-server$'
+          tar tzf "$ARCHIVE" | grep -q '/bin/moe-tiled-selftest$'
+          tar tzf "$ARCHIVE" | grep -q '/bin/moe-tiled-benchmark$'
+          tar tzf "$ARCHIVE" | grep -q '/bin/moe-tile16-compiler$'
+          tar tzf "$ARCHIVE" | grep -q '/bin/moe-serve$'
+          tar tzf "$ARCHIVE" | grep -q '/licenses/UPSTREAM-LLAMA-LICENSE$'
+          ! tar tzf "$ARCHIVE" | grep -qE '\.gguf$|\.tile16$'
+          echo "package contents OK"
+
+      - name: Upload preview package
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-virtual-memory-macos-arm64-rc14-preview
+          path: dist/*.tar.gz*
+          if-no-files-found: error

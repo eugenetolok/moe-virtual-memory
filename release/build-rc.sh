@@ -25,6 +25,8 @@ echo "configuring M1-safe build: arm64, deployment target $DEPLOY, GGML_NATIVE=O
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOY" \
+  -DCMAKE_C_FLAGS="-ffile-prefix-map=$ROOT=." \
+  -DCMAKE_CXX_FLAGS="-ffile-prefix-map=$ROOT=." \
   -DGGML_NATIVE=OFF \
   -DGGML_METAL=ON \
   -DGGML_METAL_EMBED_LIBRARY=ON \
