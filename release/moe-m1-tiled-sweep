@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Reproduce exactness and alternating TPS with the packaged static CPU runtime."""
+import argparse,json,os,pathlib,resource,statistics,subprocess,tempfile,time
+PKG=pathlib.Path(__file__).resolve().parents[1]
+def main():
+ p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--sidecar',required=True);p.add_argument('--output',default='m1-tiled-results');p.add_argument('--stage',choices=['exact','speed','all'],default='all');p.add_argument('--admission',choices=['all','time_gate'],default='all');p.add_argument('--pairs',type=int,default=4);p.add_argument('--settle-seconds',type=int,default=30);p.add_argument('--dry-run',action='store_true');args=p.parse_args();assert args.pairs>=4 and 0<=args.settle_seconds<=60
+ binary=PKG/'bin/moe-tiled-benchmark';offsets=PKG/'share/gguf_expert_offsets.csv';out=pathlib.Path(args.output).resolve()
+ if args.dry_run:print(json.dumps({'binary':str(binary),'model':args.model,'sidecar':args.sidecar,'stage':args.stage,'admission':args.admission,'pairs':args.pairs,'settle_seconds':args.settle_seconds,'profile':'M20/P2/K16/QD4 frequency_age A0 shared overlap4 graph4 CPU-only nocache','exact_generated_tokens':128,'speed_generated_tokens':600},indent=2));return
+ out.mkdir(parents=True,exist_ok=True)
+ expected='f5ee307a2982106a6eb82b62b2c00b575c9072145a759ae4660378acda8dcf2d'
+ assert subprocess.check_output([str(PKG/'bin/moe-tile16-compiler'),'--hash',args.model],text=True).strip()==expected,'original model SHA mismatch'
+ subprocess.run([str(PKG/'bin/moe-tiled-selftest')],check=True,stdout=(out/'selftest.log').open('w'),stderr=subprocess.STDOUT)
+ prompt=out/'prompt.txt';prompt.write_text('Explain how mixture-of-experts language models route tokens and why demand paging can help on a computer with very little memory.')
+ def run(label,on,n,reference=None):
+  assert not (out/(label+'.json')).exists(),('refuse overwrite',label)
+  env={k:v for k,v in os.environ.items() if not k.startswith(('LLAMA_MOE','RESEARCH_','MOE_TELEMETRY'))}
+  env.update(LLAMA_MOE_PAGING_M='20',LLAMA_MOE_PAGING_STAGE_MODE='persistent_overlap',LLAMA_MOE_PAGING_COMPUTE_MODE='direct_sparse',LLAMA_MOE_PAGING_POLICY='frequency_age',LLAMA_MOE_PAGING_BACKEND='gguf3',LLAMA_MOE_PAGING_QD='4',LLAMA_MOE_PAGING_NOCACHE='1',LLAMA_MOE_PAGING_GGUF=str(pathlib.Path(args.sidecar if on else args.model).resolve()),LLAMA_MOE_PAGING_OFFSETS=str(offsets),LLAMA_MOE_PAGING_PREFETCH_MODE='a0',LLAMA_MOE_PAGING_PREFETCH_P='2',LLAMA_MOE_PAGING_PREFETCH_K='16',LLAMA_MOE_PAGING_PREFETCH_ADMISSION=args.admission,LLAMA_MOE_PAGING_OVERLAP='1',LLAMA_MOE_PAGING_OVERLAP_THREADS='4',LLAMA_MOE_PAGING_OVERLAP_VERIFY='0',LLAMA_MOE_PAGING_LAYOUT='tile16' if on else 'raw',LLAMA_MOE_PAGING_STATS=str(out/(label+'.stats.json')),LLAMA_MOE_PAGING_STATS_INTERVAL='0',LLAMA_MOE_PAGING_TIMING='0',LLAMA_MOE_PAGING_PREFETCH_SEQ=str(out/(label+'.seq.csv')),LLAMA_MOE_PAGING_OVERLAP_EVENTS=str(out/(label+'.events.csv')),MOE_TELEMETRY='off',RESEARCH_THREADS='4',RESEARCH_SETTLE_SECONDS=str(0 if reference else args.settle_seconds))
+  if reference:env['RESEARCH_REFERENCE_READ' if on else 'RESEARCH_REFERENCE_WRITE']=str(reference)
+  argv=['/usr/bin/time','-l',str(binary),str(pathlib.Path(args.model).resolve()),str(prompt),str(n),str(on),str(out/(label+'.json'))]
+  before=resource.getrusage(resource.RUSAGE_CHILDREN);thermal=subprocess.run(['/usr/bin/pmset','-g','therm'],capture_output=True,text=True).stdout;t0=time.monotonic();print('RUN',label,flush=True)
+  with (out/(label+'.log')).open('w') as log:r=subprocess.run(argv,env=env,stdout=log,stderr=log,timeout=3600)
+  assert r.returncode==0,(label,r.returncode,'see log')
+  wall=time.monotonic()-t0;after=resource.getrusage(resource.RUSAGE_CHILDREN);a=json.loads((out/(label+'.json')).read_text());s=json.loads((out/(label+'.stats.json')).read_text())
+  for key in ('duplicate_reads','prefetch_failed','shadow_fail','direct_verify_fail','ov_verify_fail','direct_fallback_calls','direct_materialize_bytes','direct_repack_bytes','stage_bytes'):assert s[key]==0,(label,key)
+  assert s['expert_layout']==('tile16' if on else 'raw')
+  if on:assert s['tile_early_chunks']>0 and s['tile_inverse_fallback_chunks']==0 and s['tile_rows']==a['decode_calls']*983040
+  rss=[int(x.split()[0]) for x in (out/(label+'.log')).read_text().splitlines() if 'maximum resident set size' in x];assert len(rss)==1
+  cpu=after.ru_utime+after.ru_stime-before.ru_utime-before.ru_stime
+  context={'argv':argv,'env_overrides':{k:v for k,v in env.items() if k.startswith(('LLAMA_MOE','RESEARCH_','MOE_TELEMETRY'))},'settle_seconds':0 if reference else args.settle_seconds,'process_wall_seconds':wall,'process_cpu_seconds':cpu,'process_cpu_per_wall':cpu/wall,'maximum_resident_set_bytes':rss[0],'thermal_before':thermal,'generation_tps':n*1000/a['generation_loop_wall_ms'],'wait_ms_per_model_pass':s['demand_blocking_wait_ms']/a['decode_calls'],'achieved_overlap_ms_per_model_pass':s['ov_achieved_ms']/a['decode_calls'],'early_cpu_ms_per_model_pass':s['ov_cpu_ms']/a['decode_calls'],'duplicated_conversion_cpu_proxy_ms_per_model_pass':s['ov_dup_cpu_proxy_ms']/a['decode_calls'],'early_finished_before_io':s['ov_ready_before_unblock'],'early_outstanding_at_io':s['ov_ready_outstanding'],'overlap_scratch_peak_bytes':s['ov_scratch_bytes'],'startup_admission_bytes':s['tile_admission_bytes'],'startup_admission_ms':s['tile_admission_ms']}
+  (out/(label+'.context.json')).write_text(json.dumps(context,indent=2)+'\n');print('DONE',label,context['generation_tps'],flush=True);return a,s,context
+ def compare(b,c):
+  a,s,_=b;x,t,_=c;assert a['generated_tokens']==x['generated_tokens'] and a['routes']==x['routes'],'inference mismatch'
+  for key in ('logical_demand_hits','logical_demand_misses','logical_demand_bytes'):assert s[key]==t[key],key
+  keys=['ordinary_demand_read_bytes','prefetch_read_bytes','total_read_bytes','prefetch_submitted_seq_hash','prefetch_submitted_seq_n'];diff={k:[s[k],t[k]] for k in keys if s[k]!=t[k]}
+  if args.admission=='all':assert not diff,('same-work mismatch',diff)
+  return {'tokens_identical':True,'ordered_routes_identical':True,'logical_cache_identical':True,'same_work':not diff,'work_difference':diff,'baseline_work_counters':{k:s[k] for k in keys},'prototype_work_counters':{k:t[k] for k in keys}}
+ if args.stage in ('exact','all'):
+  with tempfile.TemporaryDirectory(prefix='moe-tiled-reference-',dir=out) as tmp:
+   ref=pathlib.Path(tmp)/'canonical.bin';b=run('exact_raw',0,128,ref);c=run('exact_tile',1,128,ref);proof=compare(b,c)
+   assert b[0]['exact_tensor_events']==c[0]['exact_tensor_events']==c[0]['decode_calls']*120
+   assert b[0]['exact_tensor_bytes']==c[0]['exact_tensor_bytes']==c[0]['decode_calls']*3932160
+   proof['byte_exact_output_bytes']=c[0]['exact_tensor_bytes'];(out/'exact.json').write_text(json.dumps(proof,indent=2)+'\n')
+ if args.stage in ('speed','all'):
+  pairs=[]
+  for i in range(args.pairs):
+   arms={};order=[0,1] if i%2==0 else [1,0]
+   for on in order:arms[on]=run(f'pair{i}_'+('tile' if on else 'raw'),on,600)
+   work=compare(arms[0],arms[1]);row={'pair':i,'order':['tile' if on else 'raw' for on in order],'e2e_ratio':arms[1][2]['generation_tps']/arms[0][2]['generation_tps'],'baseline':arms[0][2],'prototype':arms[1][2],'work':work};pairs.append(row)
+   report={'pairs':pairs,'complete':len(pairs)==args.pairs,'admission':args.admission,'settle_seconds':args.settle_seconds,'scope':'TPS600 generation-loop; wait/overlap625 model passes including prompt; CPU/RSS whole process; startup SHA IO reported separately; time_gate may change IO work'}
+   if report['complete']:
+    ratios=[x['e2e_ratio'] for x in pairs];report.update(median_e2e_ratio=statistics.median(ratios),HIGH_VARIANCE=min(ratios)<.9 and max(ratios)>1.1,all_same_work=all(x['work']['same_work'] for x in pairs))
+   (out/'pairs.json').write_text(json.dumps(report,indent=2)+'\n');print('PAIR',i,row['e2e_ratio'],flush=True)
+ print('Evidence:',out,flush=True)
+if __name__=='__main__':main()

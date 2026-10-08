@@ -1,0 +1,21 @@
+#!/bin/bash
+# Passive 1 Hz system/process sampler. Fixed 1800-sample cap, no privileged tools.
+set -u
+pid="$1"; output="$2"; samples=0
+case "$pid" in ''|*[!0-9]*) exit 2 ;; esac
+started=$(date +%s)
+printf '%s\n' 'unix_s,rss_kib,vsz_kib,cpu_percent,cpu_time,swap_used_mib,pageins,pageouts,compressions,decompressions,swapins,swapouts,free_pages,inactive_pages,compressed_pages' > "$output"
+while kill -0 "$pid" 2>/dev/null && [ "$samples" -lt 1800 ]; do
+  stamp=$(date +%s)
+  process=$(ps -o rss=,vsz=,%cpu=,time= -p "$pid" 2>/dev/null | awk 'NF>=4 {printf "%s,%s,%s,%s",$1,$2,$3,$4}')
+  [ -n "$process" ] || process='na,na,na,na'
+  swap=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="used"){v=$(i+2);gsub(/M/,"",v);print v}}')
+  [ -n "$swap" ] || swap=na
+  vm=$(vm_stat 2>/dev/null | awk -F: '
+    BEGIN{keys[1]="Pageins";keys[2]="Pageouts";keys[3]="Compressions";keys[4]="Decompressions";keys[5]="Swapins";keys[6]="Swapouts";keys[7]="Pages free";keys[8]="Pages inactive";keys[9]="Pages occupied by compressor"}
+    NF==2{k=$1;v=$2;gsub(/[ .]/,"",v);a[k]=v}
+    END{for(i=1;i<=9;i++)printf "%s%s",(i==1?"":","),((keys[i] in a)?a[keys[i]]:"na")}')
+  printf '%s,%s,%s,%s\n' "$stamp" "$process" "$swap" "$vm" >> "$output"
+  samples=$((samples+1)); sleep 1
+done
+printf 'samples=%s\nwall_s=%s\ncap=1800\ninterval_s=1\nscope=system VM counters; process RSS/CPU\nclock=wall unix seconds, not native steady-clock\nsampler_CPU=unavailable; overhead requires paired observer checks\n' "$samples" "$(( $(date +%s)-started ))" > "$output.meta"

@@ -1,0 +1,563 @@
+#!/bin/bash
+#
+# moe-m1-overlap-sweep - Execution-018 rc9 physical baseline-vs-overlap A0 sweep.
+#
+# Both arms use A0 P2, shared batching, M20, QD4, ngl0, direct_sparse, gguf3,
+# LRU, nocache, batch16, ubatch1, no warmup. Only resident-compute overlap differs.
+# Starts with the packaged focused exact differential, then 128-token smoke,
+# four alternating 600-token baseline/overlap pairs, shadow assertions, reference
+# parity and demand-only drift controls. Captures full routes/prefetch sequence,
+# true event overlap, CPU time and scratch. Creates a compressed evidence bundle.
+#
+# Terminal safety stops (immutable, compiled into this package): per-run swap
+# growth > 512 MiB, total swap > 1 GiB, free+inactive < 512 MiB, or OOM / load
+# failure / short generation / assertion failure. The three thresholds are
+# hard-coded and cannot be overridden; the historical MOE_SWEEP_STOP_* overrides
+# are removed and are rejected rather than honored. On a terminal stop the sweep
+# writes REBOOT-REQUIRED.txt, all evidence, and the bundle, and starts no further
+# llama-server process.
+#
+# Usage: ./bin/moe-m1-overlap-sweep --model /path/to/qwen3.6-35b-a3b.gguf [options]
+# end-help
+SELF="$0"
+while [ -h "$SELF" ]; do
+  SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
+  LINK=$(ls -ld "$SELF" | sed -e 's/.*-> //')
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$SELF_DIR/$LINK" ;; esac
+done
+BIN_DIR=$(cd "$(dirname "$SELF")" && pwd)
+PKG_DIR=$(cd "$BIN_DIR/.." && pwd)
+SERVE="$BIN_DIR/moe-serve"
+
+MODEL=""; OUT=""; PORT=8093
+STAGES="selftest,clean,smoke,pair1,pair2,pair3,pair4,assert,ref,drift"
+CTX=1024; TOKENS=600; SMOKE_TOKENS=128; ASSERT_TOKENS=128
+BATCH=16; UBATCH=1
+REFERENCE="$PKG_DIR/share/m5_reference_tokens.txt"
+# Immutable physical guard thresholds. Hard-coded; there is no environment or
+# command-line override. Raising a swap threshold or lowering the free threshold
+# would widen the physical safety envelope, so it is impossible by construction.
+STOP_SWAP_DELTA_MIB=512
+STOP_SWAP_TOTAL_MIB=1024
+STOP_FREE_MIB=512
+LOAD_TIMEOUT_S=1200; [ -n "$MOE_SWEEP_LOAD_TIMEOUT" ] && LOAD_TIMEOUT_S="$MOE_SWEEP_LOAD_TIMEOUT"
+GEN_TIMEOUT_S=2400; [ -n "$MOE_SWEEP_GEN_TIMEOUT" ] && GEN_TIMEOUT_S="$MOE_SWEEP_GEN_TIMEOUT"
+PROMPT='The quick brown fox jumps over the lazy dog. Write a detailed explanation of how mixture-of-experts language models route each token to a small number of experts, and discuss load balancing, capacity factors, and expert parallelism.'
+SEED=42
+DRY_RUN=0
+ASSERT_MODE=skipped
+
+CSV_HEADER="config,stage,mode,shared,status,tokens_requested,tokens_generated,decode_tok_s,swap_before_mib,swap_after_load_mib,swap_after_gen_mib,swap_delta_mib,free_after_load_mib,free_after_gen_mib,rss_mib,load_s,duration_s,raw_hits,raw_misses,logical_demand_hits,logical_demand_misses,logical_demand_bytes,ordinary_demand_read_bytes,prefetch_read_bytes,total_read_bytes,total_bytes_ratio,coverage,useful_ratio,ready_useful,join_useful,wasted,prefetch_lead_p50_us,prefetch_lead_p95_us,a0_compute_p50_us,a0_compute_p95_us,blocking_wait_ms,blocking_wait_ms_per_event,prefetch_expert_batches,prefetch_join_batches,prefetch_join_wait_ms,prefetch_join_wait_us_p50,prefetch_join_wait_us_p95,unrelated_batches_at_join,ready_at_demand,loading_at_demand,submitted_seq_hash,submitted_seq_n,tokens_sha,shadow_checks,shadow_fail,duplicate_reads,prefetch_failed,assert_on,safe,exclusion"
+
+die() { echo "moe-m1-overlap-sweep: ERROR: $*" >&2; exit 1; }
+note() { echo "moe-m1-overlap-sweep: $*" >&2; }
+usage() { awk 'NR>1 && /^# end-help/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
+stage_on() { case ",$STAGES," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) MODEL="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --stages) STAGES="$2"; shift 2 ;;
+    --ctx) CTX="$2"; shift 2 ;;
+    --tokens) TOKENS="$2"; shift 2 ;;
+    --smoke-tokens) SMOKE_TOKENS="$2"; shift 2 ;;
+    --assert-tokens) ASSERT_TOKENS="$2"; shift 2 ;;
+    --batch) BATCH="$2"; shift 2 ;;
+    --ubatch) UBATCH="$2"; shift 2 ;;
+    --reference) REFERENCE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument '$1' (try --help)" ;;
+  esac
+done
+
+# The historical threshold overrides are gone. Fail closed if any is present so an
+# inherited or stale environment can never widen the physical safety envelope and a
+# caller cannot silently believe a stricter override took effect.
+LEGACY_OVERRIDES=""
+for _legacy in MOE_SWEEP_STOP_SWAP_DELTA_MIB MOE_SWEEP_STOP_SWAP_TOTAL_MIB MOE_SWEEP_STOP_FREE_MIB; do
+  _legacy_val="${!_legacy-}"
+  [ -n "$_legacy_val" ] && LEGACY_OVERRIDES="${LEGACY_OVERRIDES:+$LEGACY_OVERRIDES, }$_legacy=$_legacy_val"
+done
+if [ -n "$LEGACY_OVERRIDES" ]; then
+  die "threshold overrides are removed and rejected: $LEGACY_OVERRIDES (fixed physical stops: swap-delta <= $STOP_SWAP_DELTA_MIB MiB, swap-total <= $STOP_SWAP_TOTAL_MIB MiB, free+inactive >= $STOP_FREE_MIB MiB)"
+fi
+
+[ -n "$MODEL" ] || { usage; die "--model is required"; }
+[ -x "$SERVE" ] || die "missing packaged launcher: $SERVE"
+case "$TOKENS" in ''|*[!0-9]*) die "--tokens must be an integer" ;; esac
+case "$SMOKE_TOKENS" in ''|*[!0-9]*) die "--smoke-tokens must be an integer" ;; esac
+case "$ASSERT_TOKENS" in ''|*[!0-9]*) die "--assert-tokens must be an integer" ;; esac
+case "$BATCH" in ''|*[!0-9]*) die "--batch must be an integer" ;; esac
+case "$UBATCH" in ''|*[!0-9]*) die "--ubatch must be an integer" ;; esac
+[ "$BATCH" -ge 2 ] || die "--batch must be >= 2"
+[ "$UBATCH" -ge 1 ] || die "--ubatch must be >= 1"
+[ "$UBATCH" -le "$BATCH" ] || die "--ubatch must be <= --batch"
+[ "$ASSERT_TOKENS" -ge 1 ] || die "--assert-tokens must be >= 1"
+
+serve_argv() {
+  printf -- '--model %s --profile bringup --stage-mode persistent_overlap --compute-mode direct_sparse --M 20 --qd 4 --gpu-layers 0 --ctx %s --batch %s --ubatch %s --warmup off --cache nocache --assert %s --timing off --prefetch-mode a0 --prefetch-p 2 --prefetch-shared %s --port %s' \
+    "$MODEL" "$2" "$BATCH" "$UBATCH" "$4" shared "$PORT"
+  [ "$1" = overlap ] && printf -- " --overlap on --overlap-threads 4" || printf -- " --overlap off"
+}
+serve_argv_off() {
+  printf -- '--model %s --profile bringup --stage-mode persistent_overlap --compute-mode direct_sparse --M 20 --qd 4 --gpu-layers 0 --ctx %s --batch %s --ubatch %s --warmup off --cache nocache --assert off --timing off --prefetch-mode off --prefetch-p 0 --prefetch-shared split --port %s' \
+    "$MODEL" "$1" "$BATCH" "$UBATCH" "$PORT"
+}
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "# moe-m1-overlap-sweep dry-run (stage: argv)"
+  stage_on selftest && echo "selftest: bin/moe-overlap-selftest (no model)"
+  stage_on clean && echo "clean: (no server)"
+  stage_on drift && echo "drift_pre: $(serve_argv_off "$CTX" "$TOKENS")"
+  stage_on smoke && { echo "smoke_baseline: $(serve_argv baseline "$CTX" "$SMOKE_TOKENS" off)"; echo "smoke_overlap: $(serve_argv overlap "$CTX" "$SMOKE_TOKENS" off)"; }
+  stage_on pair1 && { echo "pair1_baseline: $(serve_argv baseline "$CTX" "$TOKENS" off)"; echo "pair1_overlap: $(serve_argv overlap "$CTX" "$TOKENS" off)"; }
+  stage_on pair2 && { echo "pair2_overlap: $(serve_argv overlap "$CTX" "$TOKENS" off)"; echo "pair2_baseline: $(serve_argv baseline "$CTX" "$TOKENS" off)"; }
+  stage_on pair3 && { echo "pair3_baseline: $(serve_argv baseline "$CTX" "$TOKENS" off)"; echo "pair3_overlap: $(serve_argv overlap "$CTX" "$TOKENS" off)"; }
+  stage_on pair4 && { echo "pair4_overlap: $(serve_argv overlap "$CTX" "$TOKENS" off)"; echo "pair4_baseline: $(serve_argv baseline "$CTX" "$TOKENS" off)"; }
+  stage_on assert && echo "assert_overlap: $(serve_argv overlap "$CTX" "$ASSERT_TOKENS" on)"
+  stage_on ref && echo "ref: compare the 600-token split run against $REFERENCE"
+  stage_on drift && echo "drift_post: $(serve_argv_off "$CTX" "$TOKENS")"
+  exit 0
+fi
+
+[ -f "$MODEL" ] || die "model not found: $MODEL"
+
+STAMP=$(date '+%Y%m%d-%H%M%S')
+[ -n "$OUT" ] || OUT="$PWD/m1-overlap-$STAMP"
+mkdir -p "$OUT" || die "cannot create output dir $OUT"
+OUT=$(cd "$OUT" && pwd)
+LOGS="$OUT/logs"; MEMDIR="$OUT/memory"
+mkdir -p "$LOGS" "$MEMDIR"
+CSV="$OUT/execution018_m1_overlap.csv"; SUMMARY="$OUT/OVERLAP-SUMMARY.txt"
+HARDWARE="$OUT/hardware.txt"; REBOOT="$OUT/REBOOT-REQUIRED.txt"
+
+page_size() { vm_stat | sed -n 's/.*page size of \([0-9]*\) bytes.*/\1/p' | head -1; }
+stat_pages() { vm_stat | sed -n "s/^$1:[[:space:]]*\([0-9]*\).*/\1/p" | head -1; }
+free_mib() { local ps f i; ps=$(page_size); [ -n "$ps" ] || ps=16384; f=$(stat_pages "Pages free"); i=$(stat_pages "Pages inactive"); awk -v ps="$ps" -v f="$f" -v i="$i" 'BEGIN{printf "%d", (f+i)*ps/1048576}'; }
+swap_used_mib() { local u; u=$(sysctl -n vm.swapusage 2>/dev/null | sed -n 's/.*used = \([0-9.]*\).*/\1/p'); awk -v u="$u" 'BEGIN{printf "%d", u+0}'; }
+stats_num() { [ -f "$2" ] || { echo 0; return; }; sed -n 's/.*"'"$1"'":[[:space:]]*\([-0-9.]*\).*/\1/p' "$2" | head -1; }
+stats_str() { [ -f "$2" ] || { echo ""; return; }; sed -n 's/.*"'"$1"'":[[:space:]]*"\([^"]*\)".*/\1/p' "$2" | head -1; }
+json_num() { [ -f "$2" ] || { echo 0; return; }; sed -n 's/.*"'"$1"'":[[:space:]]*\([-0-9.]*\).*/\1/p' "$2" | head -1; }
+mem_field() { [ -f "$2" ] || { echo ""; return; }; sed -n 's/^'"$1"'=\(.*\)$/\1/p' "$2" | head -1; }
+rss_mib() { [ -n "$1" ] && [ "$1" -gt 0 ] 2>/dev/null || { echo 0; return; }; ps -o rss= -p "$1" 2>/dev/null | awk '{printf "%d", $1/1024}' || echo 0; }
+csv_init() { [ -s "$1" ] || echo "$CSV_HEADER" > "$1"; }
+tokens_from_completion() { sed -n 's/.*"tokens":\[\([^]]*\)\].*/\1/p' "$1" | tr -d ' ' | tr ',' '\n' | sed '/^$/d'; }
+tokens_sha() { [ -f "$1" ] || { echo ""; return; }; tokens_from_completion "$1" | shasum -a 256 | awk '{print $1}'; }
+ref_tokens() { tr -s ' \t\n' '\n' < "$1" | sed '/^$/d'; }
+ratio_or_na() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b+0>0) printf "%.6f", a/b; else printf "na" }'; }
+capture_mem() {
+  local cfg="$1" tag="$2" pid="$3" f="$MEMDIR/$1.$2.txt"
+  {
+    echo "# $cfg $tag $(date '+%Y-%m-%dT%H:%M:%S')"
+    echo "swap_used_mib=$(swap_used_mib)"; echo "free_mib=$(free_mib)"
+    echo "--- vm_stat ---"; vm_stat | head -14
+    echo "--- ps ---"
+    pmset -g therm 2>/dev/null || true
+    if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+      ps -o pid=,rss=,vsz=,time=,%cpu= -p "$pid" 2>/dev/null || echo "ps unavailable"
+      command -v footprint >/dev/null 2>&1 && { echo "--- footprint ---"; footprint -p "$pid" 2>/dev/null | tail -6 || true; }
+      command -v vmmap >/dev/null 2>&1 && { echo "--- vmmap -summary ---"; vmmap -summary "$pid" 2>/dev/null | head -30 || true; }
+    else echo "no pid"; fi
+  } > "$f" 2>&1
+}
+
+# run_cfg cfg stage mode ctx ntok assertv csv
+# mode: shared | split | off
+run_cfg() {
+  local cfg="$1" stage="$2" mode="$3" ctx="$4" ntok="$5" assertv="$6" csv="$7"
+  local stats="$LOGS/$cfg.stats.json" clog="$LOGS/$cfg.completion.json" slog="$LOGS/$cfg.server.log"
+  local mlog="$MEMDIR/$cfg.before.txt"
+  local pf_mode pf_p pf_shared
+  local ov=off
+  [ "$mode" = overlap ] && ov=on
+  if [ "$mode" = "off" ]; then pf_mode="off"; pf_p=0; else pf_mode="a0"; pf_p=2; fi
+  pf_shared=shared
+  local swap_before swap_afl swap_agf free_afl free_agf
+  local swap_worst free_worst swap_delta load_s=0 dur=0 health=0 http="000" tok=0 dec=0 pps=0
+  local raw_hit=0 raw_miss=0 ldh=0 ldm=0 ldb=0 odbytes=0 pbytes=0 tbytes=0 tbr=0 promo=0 sub=0
+  local ready=0 join=0 wasted=0 pfl50=0 pfl95=0 a0c50=0 a0c95=0 obs=0
+  local bw=0 bwev=0 bwtok=0 xbatches=0 jbatches=0 jwait=0 jp50=0 jp95=0 unrel=0 rdy=0 ldg=0
+  local seqhash="" seqn=0 toksha=""
+  local shchk=0 shfail=0 dup=0 pffail=0 cov="na" use="na"
+  local fail="" status="ok"
+  note "RUN $cfg: stage=$stage mode=$mode shared=$pf_shared M=20 ngl=0 ctx=$ctx tokens=$ntok assert=$assertv"
+  capture_mem "$cfg" before 0
+  swap_before=$(mem_field swap_used_mib "$mlog")
+  local t0; t0=$(date +%s)
+  "$SERVE" --model "$MODEL" --profile bringup --stage-mode persistent_overlap --compute-mode direct_sparse \
+           --M 20 --qd 4 --gpu-layers 0 --ctx "$ctx" --batch "$BATCH" --ubatch "$UBATCH" --warmup off \
+           --cache nocache --assert "$assertv" --timing off --prefetch-mode "$pf_mode" --prefetch-p "$pf_p" \
+           --prefetch-shared shared --overlap "$ov" --overlap-threads 4 \
+           --overlap-events "$LOGS/$cfg.events.csv" --prefetch-sequence "$LOGS/$cfg.seq.csv" \
+           --route-trace "$LOGS/$cfg.routes.jsonl" --port "$PORT" --stats "$stats" > "$slog" 2>&1 &
+  local pid=$!
+  local i=0
+  while [ "$i" -lt "$LOAD_TIMEOUT_S" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    http=$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null || echo 000)
+    [ "$http" = "200" ] && { health=1; break; }
+    sleep 2; i=$((i+2))
+  done
+  load_s=$(( $(date +%s) - t0 )); local rss; rss=$(rss_mib "$pid")
+  capture_mem "$cfg" after_load "$pid"
+  swap_afl=$(mem_field swap_used_mib "$MEMDIR/$cfg.after_load.txt"); free_afl=$(mem_field free_mib "$MEMDIR/$cfg.after_load.txt")
+  if [ "$health" -eq 1 ]; then
+    http=$(curl --noproxy '*' -s -o "$clog" -w '%{http_code}' --max-time "$GEN_TIMEOUT_S" \
+      "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+      -d "{\"prompt\":\"$PROMPT\",\"n_predict\":$ntok,\"temperature\":0,\"seed\":$SEED,\"return_tokens\":true,\"cache_prompt\":false,\"stream\":false,\"top_k\":1,\"ignore_eos\":true}" 2>/dev/null || echo 000)
+    tok=$(json_num tokens_predicted "$clog"); [ -n "$tok" ] || tok=0
+    if [ "$tok" -lt 1 ]; then status="fail"
+      if grep -qE 'OutOfMemory|Insufficient Memory' "$slog" 2>/dev/null; then fail="metal_oom_compute"; else fail="compute_error_http_$http"; fi
+    elif [ "$tok" -lt "$ntok" ]; then status="partial"; fail="short_generation"; fi
+  else
+    status="fail"
+    if grep -qE 'OutOfMemory|Insufficient Memory|kIOGPUCommandBufferCallbackErrorOutOfMemory' "$slog" 2>/dev/null; then fail="metal_oom_load"
+    elif grep -qE 'GGML_ASSERT|Abort trap|SIGABRT|ggml_abort' "$slog" 2>/dev/null; then fail="paging_assert_or_crash"
+    else fail="load_failed"; fi
+  fi
+  capture_mem "$cfg" after_gen "$pid"
+  swap_agf=$(mem_field swap_used_mib "$MEMDIR/$cfg.after_gen.txt"); free_agf=$(mem_field free_mib "$MEMDIR/$cfg.after_gen.txt")
+  kill -TERM "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  dur=$(( $(date +%s) - t0 ))
+  dec=$(json_num predicted_per_second "$clog"); [ -n "$dec" ] || dec=0
+  pps=$(json_num prompt_per_second "$clog"); [ -n "$pps" ] || pps=0
+  raw_hit=$(stats_num hits "$stats"); raw_miss=$(stats_num misses "$stats")
+  ldh=$(stats_num logical_demand_hits "$stats"); ldm=$(stats_num logical_demand_misses "$stats")
+  ldb=$(stats_num logical_demand_bytes "$stats")
+  odbytes=$(stats_num ordinary_demand_read_bytes "$stats")
+  pbytes=$(stats_num prefetch_read_bytes "$stats")
+  tbytes=$(stats_num total_read_bytes "$stats"); tbr=$(stats_num total_bytes_ratio "$stats")
+  bw=$(stats_num ov_idle_wait_ms "$stats"); bwev=$(stats_num demand_blocking_wait_events "$stats")
+  xbatches=$(stats_num prefetch_expert_batches_submitted "$stats")
+  jbatches=$(stats_num prefetch_join_batches "$stats"); jwait=$(stats_num prefetch_join_wait_ms "$stats")
+  jp50=$(stats_num prefetch_join_wait_us_p50 "$stats"); jp95=$(stats_num prefetch_join_wait_us_p95 "$stats")
+  unrel=$(stats_num prefetch_unrelated_batches_still_active_at_join "$stats")
+  rdy=$(stats_num prefetch_ready_at_demand "$stats"); ldg=$(stats_num prefetch_loading_at_demand "$stats")
+  promo=$(stats_num prefetch_promotions "$stats"); sub=$(stats_num prefetch_submitted_experts "$stats")
+  ready=$(stats_num prefetch_ready_useful "$stats"); join=$(stats_num prefetch_join_useful "$stats")
+  wasted=$(stats_num prefetch_wasted "$stats")
+  pfl50=$(stats_num prefetch_lead_us_p50 "$stats"); pfl95=$(stats_num prefetch_lead_us_p95 "$stats")
+  a0c50=$(stats_num a0_compute_us_p50 "$stats"); a0c95=$(stats_num a0_compute_us_p95 "$stats")
+  obs=$(stats_num decode_tokens_observed "$stats")
+  seqhash=$(stats_str prefetch_submitted_seq_hash "$stats"); seqn=$(stats_num prefetch_submitted_seq_n "$stats")
+  toksha=$(tokens_sha "$clog")
+  shchk=$(stats_num shadow_checks "$stats"); shfail=$(stats_num shadow_fail "$stats")
+  dup=$(stats_num duplicate_reads "$stats"); pffail=$(stats_num prefetch_failed "$stats")
+  cov=$(ratio_or_na "$promo" "$ldm"); use=$(ratio_or_na "$promo" "$sub")
+  bwtok=$(ratio_or_na "$bw" "$bwev")
+  for key in duplicate_reads prefetch_failed shadow_fail direct_fallback_calls direct_materialize_bytes direct_repack_bytes stage_bytes logical_demand_hits logical_demand_misses total_read_bytes token_events ov_achieved_ms; do
+    if ! grep -q '"'"$key"'"' "$stats"; then status=fail; fail="missing_counter:$key"; fi
+  done
+  for key in duplicate_reads prefetch_failed shadow_fail direct_fallback_calls direct_materialize_bytes direct_repack_bytes stage_bytes; do
+    [ "$(stats_num "$key" "$stats")" = 0 ] || { status=fail; fail="nonzero:$key"; }
+  done
+  [ "$mode" != overlap ] || [ "$(stats_num ov_events "$stats")" -gt 0 ] || { status=fail; fail=no_early_work; }
+  local safe=1 excl="" run_safety=""
+  swap_worst=$(awk -v a="$swap_afl" -v b="$swap_agf" 'BEGIN{print (a>b)?a:b}')
+  free_worst=$(awk -v a="$free_afl" -v b="$free_agf" 'BEGIN{print (a<b)?a:b}')
+  swap_delta=$((swap_worst-swap_before))
+  [ "$swap_delta" -gt "$STOP_SWAP_DELTA_MIB" ] && run_safety="swap_delta"
+  [ -z "$run_safety" ] && [ "$swap_worst" -gt "$STOP_SWAP_TOTAL_MIB" ] && run_safety="swap_total"
+  [ -z "$run_safety" ] && [ "$free_worst" -lt "$STOP_FREE_MIB" ] && run_safety="free_low"
+  if [ "$status" != "ok" ]; then safe=0; excl="run_failure:$fail"
+  elif [ -n "$run_safety" ]; then safe=0; excl="safety:$run_safety"; fi
+  LAST_CFG="$cfg"; LAST_STAGE="$stage"; LAST_MODE="$mode"; LAST_SHARED="$pf_shared"
+  LAST_STATUS="$status"; LAST_FAIL="$fail"; LAST_DEC="$dec"; LAST_SAFE="$safe"
+  LAST_SEQHASH="$seqhash"; LAST_SEQN="$seqn"; LAST_TOKSHA="$toksha"
+  LAST_LDH="$ldh"; LAST_LDM="$ldm"; LAST_LDB="$ldb"; LAST_ODB="$odbytes"; LAST_PB="$pbytes"
+  LAST_TB="$tbytes"; LAST_TBR="$tbr"; LAST_BW="$bw"; LAST_BWEV="$bwev"; LAST_BWTOK="$bwtok"
+  LAST_XB="$xbatches"; LAST_JB="$jbatches"; LAST_JW="$jwait"; LAST_JP50="$jp50"; LAST_JP95="$jp95"
+  LAST_UNREL="$unrel"; LAST_RDY="$rdy"; LAST_LDG="$ldg"
+  LAST_SHFAIL="$shfail"; LAST_DUP="$dup"; LAST_PFFAIL="$pffail"
+  LAST_COV="$cov"; LAST_USEFUL="$use"
+  LAST_READY="$ready"; LAST_JOIN="$join"; LAST_WASTED="$wasted"
+  LAST_PFL50="$pfl50"; LAST_PFL95="$pfl95"; LAST_A0C50="$a0c50"; LAST_A0C95="$a0c95"
+  LAST_EXCL="$excl"; LAST_SAFETY="$run_safety"
+  csv_init "$csv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$cfg" "$stage" "$mode" "$pf_shared" "$status" "$ntok" "$tok" "$dec" \
+    "$swap_before" "$swap_afl" "$swap_agf" "$swap_delta" "$free_afl" "$free_agf" "$rss" \
+    "$load_s" "$dur" "$raw_hit" "$raw_miss" "$ldh" "$ldm" "$ldb" "$odbytes" "$pbytes" "$tbytes" "$tbr" \
+    "$cov" "$use" "$ready" "$join" "$wasted" "$pfl50" "$pfl95" "$a0c50" "$a0c95" "$bw" "$bwtok" \
+    "$xbatches" "$jbatches" "$jwait" "$jp50" "$jp95" "$unrel" "$rdy" "$ldg" \
+    "$seqhash" "$seqn" "$toksha" \
+    "$shchk" "$shfail" "$dup" "$pffail" "$assertv" "$safe" "$excl" >> "$csv"
+  [ "$status" = "ok" ] && return 0; return 1
+}
+
+run_checked() {
+  local before_swap before_free
+  before_swap=$(swap_used_mib); before_free=$(free_mib)
+  if [ "$before_swap" -gt "$STOP_SWAP_TOTAL_MIB" ] || [ "$before_free" -lt "$STOP_FREE_MIB" ]; then
+    TERMINAL_STOP="safety:before_run"; echo "$TERMINAL_STOP" > "$REBOOT"; return 1
+  fi
+  run_cfg "$@" || true
+  if [ -n "$LAST_SAFETY" ]; then TERMINAL_STOP="safety:$LAST_SAFETY"
+  elif [ "$LAST_STATUS" != "ok" ]; then TERMINAL_STOP="run_failure:$LAST_FAIL"; fi
+  if [ -n "$TERMINAL_STOP" ]; then
+    echo "TERMINAL STOP: $TERMINAL_STOP after $LAST_CFG; no further llama-server process will start" | tee -a "$SUMMARY"
+    : > "$REBOOT"
+    printf 'reason=%s\nconfig=%s\nstatus=%s\nfailure=%s\ntimestamp=%s\n' \
+      "$TERMINAL_STOP" "$LAST_CFG" "$LAST_STATUS" "$LAST_FAIL" "$STAMP" >> "$REBOOT"
+    return 1
+  fi
+  local counterpart=""
+  case "$LAST_CFG" in
+    *_overlap) counterpart="${LAST_CFG%_overlap}_baseline" ;;
+    *_baseline) counterpart="${LAST_CFG%_baseline}_overlap" ;;
+  esac
+  if [ -n "$counterpart" ] && [ -f "$LOGS/$counterpart.completion.json" ]; then
+    local exact_failure=""
+    [ "$(tokens_sha "$LOGS/$counterpart.completion.json")" = "$LAST_TOKSHA" ] || exact_failure=tokens
+    cmp -s "$LOGS/$counterpart.routes.jsonl" "$LOGS/$LAST_CFG.routes.jsonl" || exact_failure=ordered_routes
+    cmp -s "$LOGS/$counterpart.seq.csv" "$LOGS/$LAST_CFG.seq.csv" || exact_failure=prefetch_sequence
+    for key in logical_demand_hits logical_demand_misses logical_demand_bytes ordinary_demand_read_bytes prefetch_read_bytes total_read_bytes prefetch_submitted_seq_n; do
+      [ "$(stats_num "$key" "$LOGS/$counterpart.stats.json")" = "$(stats_num "$key" "$LOGS/$LAST_CFG.stats.json")" ] || exact_failure="$key"
+    done
+    if [ -n "$exact_failure" ]; then
+      TERMINAL_STOP="exactness:$exact_failure"; echo "$TERMINAL_STOP" > "$REBOOT"; return 1
+    fi
+  fi
+  return 0
+}
+
+csv_init "$CSV"
+[ -f "$REFERENCE" ] && cp "$REFERENCE" "$OUT/reference_tokens.txt"
+: > "$SUMMARY"
+TERMINAL_STOP=""
+SHFAIL_TOTAL=0; DUP_TOTAL=0; PFFAIL_TOTAL=0; A0_RUNS=0
+DRIFT_PRE_DEC=""; DRIFT_POST_DEC=""
+P1_S_DEC=""; P1_X_DEC=""; P1_S_BW=""; P1_X_BW=""; P1_S_HASH=""; P1_X_HASH=""
+P1_S_LDH=""; P1_X_LDH=""; P1_S_LDM=""; P1_X_LDM=""; P1_S_TRB=""; P1_X_TRB=""; P1_S_TOK=""; P1_X_TOK=""
+P2_S_DEC=""; P2_X_DEC=""; P2_S_BW=""; P2_X_BW=""; P2_S_HASH=""; P2_X_HASH=""
+P2_S_LDH=""; P2_X_LDH=""; P2_S_LDM=""; P2_X_LDM=""; P2_S_TRB=""; P2_X_TRB=""; P2_S_TOK=""; P2_X_TOK=""
+P3_S_DEC=""; P3_X_DEC=""; P3_S_BW=""; P3_X_BW=""; P3_S_HASH=""; P3_X_HASH=""
+P3_S_LDH=""; P3_X_LDH=""; P3_S_LDM=""; P3_X_LDM=""; P3_S_TRB=""; P3_X_TRB=""; P3_S_TOK=""; P3_X_TOK=""
+P4_S_DEC=""; P4_X_DEC=""; P4_S_BW=""; P4_X_BW=""; P4_S_HASH=""; P4_X_HASH=""
+P4_S_LDH=""; P4_X_LDH=""; P4_S_LDM=""; P4_X_LDM=""; P4_S_TRB=""; P4_X_TRB=""; P4_S_TOK=""; P4_X_TOK=""
+
+capture_stage_run() {
+  local prefix="$1"
+  local d="$LAST_DEC" bw="$LAST_BW" h="$LAST_SEQHASH" ldh="$LAST_LDH" ldm="$LAST_LDM" trb="$LAST_TBR" tk="$LAST_TOKSHA"
+  eval "$prefix"'_DEC="$d"'
+  eval "$prefix"'_BW="$bw"'
+  eval "$prefix"'_HASH="$h"'
+  eval "$prefix"'_LDH="$ldh"'
+  eval "$prefix"'_LDM="$ldm"'
+  eval "$prefix"'_TRB="$trb"'
+  eval "$prefix"'_TOK="$tk"'
+}
+
+if stage_on selftest; then
+  if ! "$BIN_DIR/moe-overlap-selftest" > "$OUT/D1-SELFTEST.txt" 2>&1; then
+    TERMINAL_STOP="exactness:D1"; echo "$TERMINAL_STOP" > "$REBOOT"
+  fi
+fi
+
+if stage_on clean; then
+  {
+    echo "moe-m1-overlap-sweep timestamp=$STAMP"; echo "uname_m=$(uname -m)"
+    echo "sw_vers=$(sw_vers -productVersion 2>/dev/null) ($(sw_vers -buildVersion 2>/dev/null))"
+    echo "hw_model=$(sysctl -n hw.model 2>/dev/null)"; echo "chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+    echo "hw_memsize_bytes=$(sysctl -n hw.memsize 2>/dev/null)"; echo "pagesize=$(page_size)"
+    echo "swap_at_start_mib=$(swap_used_mib)"; echo "free_at_start_mib=$(free_mib)"
+    echo "reference=$REFERENCE"
+    [ -f "$REFERENCE" ] && echo "reference_sha256=$(shasum -a 256 "$REFERENCE" | awk '{print $1}')"
+    echo "stop_swap_delta_mib=$STOP_SWAP_DELTA_MIB"; echo "stop_swap_total_mib=$STOP_SWAP_TOTAL_MIB"
+    echo "stop_free_mib=$STOP_FREE_MIB"
+  } > "$HARDWARE" 2>&1
+fi
+
+if stage_on smoke; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked smoke_baseline smoke baseline "$CTX" "$SMOKE_TOKENS" off "$CSV"; then
+      SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1))
+    fi
+  fi
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked smoke_overlap smoke overlap "$CTX" "$SMOKE_TOKENS" off "$CSV"; then
+      SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1))
+    fi
+  fi
+fi
+
+if stage_on drift; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    run_checked drift_pre drift off "$CTX" "$TOKENS" off "$CSV" || true
+    [ -z "$TERMINAL_STOP" ] && DRIFT_PRE_DEC="$LAST_DEC"
+  fi
+fi
+
+if stage_on pair1; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair1_baseline pair1 baseline "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P1_S; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair1_overlap pair1 overlap "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P1_X; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+fi
+
+if stage_on pair2; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair2_overlap pair2 overlap "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P2_X; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair2_baseline pair2 baseline "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P2_S; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+fi
+
+if stage_on pair3; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair3_baseline pair3 baseline "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P3_S; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair3_overlap pair3 overlap "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P3_X; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+fi
+
+if stage_on pair4; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair4_overlap pair4 overlap "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P4_X; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+  if [ -z "$TERMINAL_STOP" ]; then
+    if run_checked pair4_baseline pair4 baseline "$CTX" "$TOKENS" off "$CSV"; then capture_stage_run P4_S; SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+  fi
+fi
+
+if [ -z "$TERMINAL_STOP" ] && stage_on assert; then
+  run_checked assert_overlap assert overlap "$CTX" "$ASSERT_TOKENS" on "$CSV" || true
+  if [ -n "$TERMINAL_STOP" ]; then ASSERT_MODE="FAIL:$LAST_FAIL"; else ASSERT_MODE="PASS"; fi
+  if [ -z "$TERMINAL_STOP" ]; then SHFAIL_TOTAL=$((SHFAIL_TOTAL+LAST_SHFAIL)); DUP_TOTAL=$((DUP_TOTAL+LAST_DUP)); PFFAIL_TOTAL=$((PFFAIL_TOTAL+LAST_PFFAIL)); A0_RUNS=$((A0_RUNS+1)); fi
+fi
+
+PARITY="skipped"; PARITY_MATCHED=0; PARITY_REF=0
+if [ -z "$TERMINAL_STOP" ] && stage_on ref; then
+  if [ -f "$REFERENCE" ]; then
+    PARITY_REF=$(ref_tokens "$REFERENCE" | wc -l | tr -d ' ')
+    clog="$LOGS/pair1_overlap.completion.json"
+    if [ -f "$clog" ]; then
+      PARITY_MATCHED=$(paste <(tokens_from_completion "$clog") <(ref_tokens "$REFERENCE") | awk '$1==$2{c++} END{print c+0}')
+      if [ "$PARITY_MATCHED" = "$PARITY_REF" ] && [ "$PARITY_REF" -gt 0 ]; then PARITY="PASS"; else PARITY="FAIL"; fi
+    else PARITY="NO_SPLIT_600_RUN"; fi
+  else PARITY="NO_REFERENCE"; fi
+fi
+
+if [ "$PARITY" = FAIL ] || [ "$PARITY" = NO_REFERENCE ]; then
+  TERMINAL_STOP="exactness:reference"; echo "$TERMINAL_STOP" > "$REBOOT"
+fi
+
+if stage_on drift; then
+  if [ -z "$TERMINAL_STOP" ]; then
+    run_checked drift_post drift off "$CTX" "$TOKENS" off "$CSV" || true
+    [ -z "$TERMINAL_STOP" ] && DRIFT_POST_DEC="$LAST_DEC"
+  fi
+fi
+
+# ---- physical verdict ----
+P1_EXACT="no"
+if [ -n "$P1_S_HASH" ] && [ "$P1_S_HASH" = "$P1_X_HASH" ] && [ "$P1_S_LDH" = "$P1_X_LDH" ] && [ "$P1_S_LDM" = "$P1_X_LDM" ] && [ "$P1_S_TRB" = "$P1_X_TRB" ] && [ "$P1_S_TOK" = "$P1_X_TOK" ]; then P1_EXACT="yes"; fi
+P2_EXACT="no"
+if [ -n "$P2_S_HASH" ] && [ "$P2_S_HASH" = "$P2_X_HASH" ] && [ "$P2_S_LDH" = "$P2_X_LDH" ] && [ "$P2_S_LDM" = "$P2_X_LDM" ] && [ "$P2_S_TRB" = "$P2_X_TRB" ] && [ "$P2_S_TOK" = "$P2_X_TOK" ]; then P2_EXACT="yes"; fi
+P3_EXACT="no"
+if [ -n "$P3_S_HASH" ] && [ "$P3_S_HASH" = "$P3_X_HASH" ] && [ "$P3_S_LDH" = "$P3_X_LDH" ] && [ "$P3_S_LDM" = "$P3_X_LDM" ] && [ "$P3_S_TRB" = "$P3_X_TRB" ] && [ "$P3_S_TOK" = "$P3_X_TOK" ]; then P3_EXACT="yes"; fi
+P4_EXACT="no"
+if [ -n "$P4_S_HASH" ] && [ "$P4_S_HASH" = "$P4_X_HASH" ] && [ "$P4_S_LDH" = "$P4_X_LDH" ] && [ "$P4_S_LDM" = "$P4_X_LDM" ] && [ "$P4_S_TRB" = "$P4_X_TRB" ] && [ "$P4_S_TOK" = "$P4_X_TOK" ]; then P4_EXACT="yes"; fi
+
+P1_XE=$(ratio_or_na "$P1_X_DEC" "$P1_S_DEC"); P2_XE=$(ratio_or_na "$P2_X_DEC" "$P2_S_DEC")
+P3_XE=$(ratio_or_na "$P3_X_DEC" "$P3_S_DEC"); P4_XE=$(ratio_or_na "$P4_X_DEC" "$P4_S_DEC")
+for v in P1_XE P2_XE P3_XE P4_XE; do eval "[ \"\$$v\" = na ] && $v=\"\""; done
+P1_XW=$(ratio_or_na "$P1_X_BW" "$P1_S_BW"); P2_XW=$(ratio_or_na "$P2_X_BW" "$P2_S_BW")
+P3_XW=$(ratio_or_na "$P3_X_BW" "$P3_S_BW"); P4_XW=$(ratio_or_na "$P4_X_BW" "$P4_S_BW")
+for v in P1_XW P2_XW P3_XW P4_XW; do eval "[ \"\$$v\" = na ] && $v=\"\""; done
+
+median4() { printf '%s\n' "$1" "$2" "$3" "$4" | sort -n | awk '{a[NR]=$1} END{ if(NR%2==1) printf "%.4f", a[(NR+1)/2]; else printf "%.4f", (a[NR/2]+a[NR/2+1])/2 }'; }
+geomean4() { awk -v a="$1" -v b="$2" -v c="$3" -v d="$4" 'BEGIN{ if(a<=0||b<=0||c<=0||d<=0){printf "na"; exit} printf "%.4f", exp((log(a)+log(b)+log(c)+log(d))/4) }'; }
+spread4() { awk -v a="$1" -v b="$2" -v c="$3" -v d="$4" 'BEGIN{ mn=a; if(b<mn)mn=b; if(c<mn)mn=c; if(d<mn)mn=d; mx=a; if(b>mx)mx=b; if(c>mx)mx=c; if(d>mx)mx=d; printf "%.4f", mx-mn }'; }
+
+E2E_MED=""; WR_MED=""; E2E_GM=""; E2E_SPREAD=""; S_MED=""; X_MED=""
+if [ -n "$P1_XE" ] && [ -n "$P2_XE" ] && [ -n "$P3_XE" ] && [ -n "$P4_XE" ]; then
+  E2E_MED=$(median4 "$P1_XE" "$P2_XE" "$P3_XE" "$P4_XE")
+  E2E_GM=$(geomean4 "$P1_XE" "$P2_XE" "$P3_XE" "$P4_XE")
+  E2E_SPREAD=$(spread4 "$P1_XE" "$P2_XE" "$P3_XE" "$P4_XE")
+fi
+if [ -n "$P1_XW" ] && [ -n "$P2_XW" ] && [ -n "$P3_XW" ] && [ -n "$P4_XW" ]; then
+  WR_MED=$(median4 "$P1_XW" "$P2_XW" "$P3_XW" "$P4_XW")
+fi
+if [ -n "$P1_S_DEC" ] && [ -n "$P2_S_DEC" ] && [ -n "$P3_S_DEC" ] && [ -n "$P4_S_DEC" ]; then
+  S_MED=$(median4 "$P1_S_DEC" "$P2_S_DEC" "$P3_S_DEC" "$P4_S_DEC")
+fi
+if [ -n "$P1_X_DEC" ] && [ -n "$P2_X_DEC" ] && [ -n "$P3_X_DEC" ] && [ -n "$P4_X_DEC" ]; then
+  X_MED=$(median4 "$P1_X_DEC" "$P2_X_DEC" "$P3_X_DEC" "$P4_X_DEC")
+fi
+
+HIGH_VAR="no"
+if [ -n "$E2E_MED" ]; then
+  if awk -v a="$P1_XE" -v b="$P2_XE" -v c="$P3_XE" -v d="$P4_XE" 'BEGIN{ lo=0; hi=0; if(a<0.90||b<0.90||c<0.90||d<0.90)lo=1; if(a>1.10||b>1.10||c>1.10||d>1.10)hi=1; exit !(lo&&hi) }'; then HIGH_VAR="yes"; fi
+fi
+
+EXACT="not_evaluated"
+if [ -n "$TERMINAL_STOP" ]; then EXACT="BLOCKED_TERMINAL"
+elif ! stage_on pair1 || ! stage_on pair2 || ! stage_on pair3 || ! stage_on pair4; then EXACT="not_evaluated"
+elif [ "$PARITY" = "NO_SPLIT_600_RUN" ] || [ "$PARITY" = "skipped" ]; then EXACT="not_evaluated"
+elif [ "$PARITY" = "PASS" ] && [ "$SHFAIL_TOTAL" = "0" ] && [ "$DUP_TOTAL" = "0" ] && [ "$PFFAIL_TOTAL" = "0" ] && \
+     [ "$P1_EXACT" = "yes" ] && [ "$P2_EXACT" = "yes" ] && [ "$P3_EXACT" = "yes" ] && [ "$P4_EXACT" = "yes" ]; then EXACT="PASS"; else EXACT="FAIL"; fi
+
+SIGNAL="not_evaluated"
+if [ -n "$E2E_MED" ] && [ -n "$WR_MED" ]; then
+  if awk -v e="$E2E_MED" 'BEGIN{exit !(e>=1.03)}'; then SIGNAL="e2e"
+  elif awk -v w="$WR_MED" -v e="$E2E_MED" 'BEGIN{exit !(w<=0.90 && e>=0.995)}'; then SIGNAL="wait"
+  else SIGNAL="none"; fi
+fi
+
+DRIFT_RATIO="na"
+[ -n "$DRIFT_PRE_DEC" ] && [ -n "$DRIFT_POST_DEC" ] && \
+  DRIFT_RATIO=$(awk -v a="$DRIFT_POST_DEC" -v b="$DRIFT_PRE_DEC" 'BEGIN{ if(b>0) printf "%.4f", a/b; else printf "na" }')
+
+{
+  echo "Execution 018 rc9 M1 physical baseline-vs-overlap A0 sweep"
+  echo "timestamp: $STAMP"
+  echo "model: $MODEL"
+  echo "reference: $REFERENCE"
+  echo ""
+  echo "Config (fresh process per run): ngl=0 M20 direct_sparse QD4 LRU gguf3 nocache batch=$BATCH ubatch=$UBATCH warmup=off persistent_overlap"
+  echo "Arms: baseline overlap=off, prototype overlap=on threads=4; both A0 P2, prefetch-shared=1"
+  echo "Stages: $STAGES"
+  echo ""
+  echo "Sustained alternating pairs (ctx $CTX, $TOKENS tokens):"
+  printf '  pair1 baseline->overlap: baseline %s tok/s, overlap %s tok/s, E2E overlap/baseline %s; blocking wait %s -> %s ms total (prompt+decode), ratio %s\n' "$P1_S_DEC" "$P1_X_DEC" "$P1_XE" "$P1_S_BW" "$P1_X_BW" "$P1_XW"
+  printf '  pair2 overlap->baseline: baseline %s tok/s, overlap %s tok/s, E2E overlap/baseline %s; blocking wait %s -> %s ms total (prompt+decode), ratio %s\n' "$P2_S_DEC" "$P2_X_DEC" "$P2_XE" "$P2_S_BW" "$P2_X_BW" "$P2_XW"
+  printf '  pair3 baseline->overlap: baseline %s tok/s, overlap %s tok/s, E2E overlap/baseline %s; blocking wait %s -> %s ms total (prompt+decode), ratio %s\n' "$P3_S_DEC" "$P3_X_DEC" "$P3_XE" "$P3_S_BW" "$P3_X_BW" "$P3_XW"
+  printf '  pair4 overlap->baseline: baseline %s tok/s, overlap %s tok/s, E2E overlap/baseline %s; blocking wait %s -> %s ms total (prompt+decode), ratio %s\n' "$P4_S_DEC" "$P4_X_DEC" "$P4_XE" "$P4_S_BW" "$P4_X_BW" "$P4_XW"
+  echo "  mode medians: baseline $S_MED tok/s, overlap $X_MED tok/s"
+  echo "  median E2E overlap/baseline: $E2E_MED; geometric mean: $E2E_GM; spread: $E2E_SPREAD"
+  echo "  median blocking-wait ratio: $WR_MED"
+  echo "  HIGH_VARIANCE: $HIGH_VAR (yes if any pair <0.90 and any >1.10)"
+  echo ""
+  echo "Exactness / invariants (per pair: overlap vs baseline seq hash, logical hits/misses, total bytes, token sha):"
+  echo "  pair1: $P1_EXACT (baseline hash $P1_S_HASH / overlap hash $P1_X_HASH)"
+  echo "  pair2: $P2_EXACT (baseline hash $P2_S_HASH / overlap hash $P2_X_HASH)"
+  echo "  pair3: $P3_EXACT (baseline hash $P3_S_HASH / overlap hash $P3_X_HASH)"
+  echo "  pair4: $P4_EXACT (baseline hash $P4_S_HASH / overlap hash $P4_X_HASH)"
+  echo "  shadow_fail total: $SHFAIL_TOTAL; duplicate_reads total: $DUP_TOTAL; prefetch_failed total: $PFFAIL_TOTAL"
+  echo "  reference parity (pair1 overlap $TOKENS): $PARITY ($PARITY_MATCHED/$PARITY_REF)"
+  echo "  assertion run: $ASSERT_MODE"
+  echo "  => $EXACT"
+  echo ""
+  echo "Whole-run numeric signal (prompt+decode wait; provisional): $SIGNAL"
+  echo "Use the event-level decode analysis for E1; no automatic promotion from this shell summary."
+  echo "  (not declared success unless terminal-safe, exactness PASS, and the median statistic passes)"
+  echo "  drift control (demand-only post/pre): $DRIFT_RATIO ($DRIFT_PRE_DEC -> $DRIFT_POST_DEC tok/s)"
+  echo ""
+  echo "A0 runs: $A0_RUNS"
+  [ -n "$TERMINAL_STOP" ] && echo "TERMINAL STOP: $TERMINAL_STOP (no further llama-server process started)"
+  echo "CSV: execution018_m1_overlap.csv; logs/; memory/; hardware.txt"
+} > "$SUMMARY" 2>&1
+
+BUNDLE="$OUT.bundle.tar.gz"
+gzip -f "$LOGS"/*.routes.jsonl "$LOGS"/*.seq.csv "$LOGS"/*.events.csv 2>/dev/null || true
+tar czf "$BUNDLE" -C "$(dirname "$OUT")" "$(basename "$OUT")" 2>/dev/null || true
+cat "$SUMMARY"; echo ""; echo "bundle: $BUNDLE"
+[ -z "$TERMINAL_STOP" ] || exit 1
