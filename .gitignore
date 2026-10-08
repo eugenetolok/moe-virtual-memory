@@ -1,0 +1,20 @@
+# Local reconstructed upstream checkout and build products
+llama.cpp/
+dist/
+.tools/
+
+# Python / editor / macOS noise
+__pycache__/
+*.pyc
+.DS_Store
+
+# Model data and generated sidecars must never be committed
+*.gguf
+*.tile16
+*.tile16.index.json
+
+# Local benchmark bundles and logs
+m1-combinations/
+m1-combinations-*/
+*.bundle.tar.gz
+*.log
