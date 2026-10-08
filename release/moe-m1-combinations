@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Fixed expert-RAM 2x2x2x2 exactness and balanced throughput experiment."""
+import argparse,fcntl,gzip,hashlib,itertools,json,os,pathlib,re,statistics,subprocess,tempfile,threading,time
+PKG=pathlib.Path(__file__).resolve().parents[1]
+MODEL_SHA='f5ee307a2982106a6eb82b62b2c00b575c9072145a759ae4660378acda8dcf2d'
+PROMPT='Explain how mixture-of-experts language models route tokens and why demand paging can help on a computer with very little memory.'
+def need(ok,message):
+ if not ok:raise RuntimeError(message)
+def sha(p):return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+def save(p,d):
+ tmp=p.with_suffix(p.suffix+'.tmp');tmp.write_text(json.dumps(d,indent=2)+'\n');tmp.replace(p)
+def probe(argv):
+ try:
+  r=subprocess.run(argv,capture_output=True,text=True,timeout=3);return {'returncode':r.returncode,'stdout':r.stdout,'stderr':r.stderr}
+ except Exception as e:return {'error':str(e)}
+def snapshot():
+ vm=probe(['/usr/bin/vm_stat']);swap=probe(['/usr/sbin/sysctl','-n','vm.swapusage']);v={}
+ for line in vm.get('stdout','').splitlines():
+  if ':' in line:
+   key,value=line.split(':',1);value=value.strip().strip('.');
+   if value.isdigit():v[key]=int(value)
+ m=re.search(r'used\s*=\s*([0-9.]+)([KMG])',swap.get('stdout',''))
+ return {'unix_s':time.time(),'vm_pages':v,'swap_used_bytes':int(float(m[1])*1024**{'K':1,'M':2,'G':3}[m[2]]) if m else None,'vm_stat':vm,'swapusage':swap}
+def configs():
+ return [{'id':f'{layout}_{policy}_pf{pf}_ov{ov}','layout':layout,'policy':policy,'prefetch':pf,'overlap':ov,'M':20 if pf else 22,'P':2 if pf else 0,'total_expert_slots':22} for policy,pf,ov in itertools.product(['lru','frequency_age'],[0,1],[0,1]) for layout in ['raw','tile16']]
+def main():
+ p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--sidecar',required=True);p.add_argument('--output',default='m1-combinations');p.add_argument('--stage',choices=['exact','speed','all'],default='all');p.add_argument('--rounds',type=int,default=4);p.add_argument('--settle-seconds',type=int,default=30);p.add_argument('--resume',action='store_true');p.add_argument('--dry-run',action='store_true');a=p.parse_args();need(a.rounds>=4 and 0<=a.settle_seconds<=60,'rounds>=4, settle0..60 required')
+ cells=configs();out=pathlib.Path(a.output).resolve();model=pathlib.Path(a.model).resolve();sidecar=pathlib.Path(a.sidecar).resolve()
+ if a.dry_run:print(json.dumps({'configs':cells,'rounds':a.rounds,'settle_seconds':a.settle_seconds,'exact_tokens':128,'speed_tokens':600,'expert_cache_bytes':22*40*2039808,'order':'adjacent raw/tile pairs; rotate4 cells per round, reverse odd rounds'},indent=2));return
+ out.mkdir(parents=True,exist_ok=True);lock=(out/'run.lock').open('w');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ need(a.resume or not (out/'manifest.json').exists(),'existing dataset: use --resume or new output')
+ binary=PKG/'bin/moe-tiled-benchmark';compiler=PKG/'bin/moe-tile16-compiler'
+ need(subprocess.check_output([str(compiler),'--hash',str(model)],text=True).strip()==MODEL_SHA,'original model SHA mismatch')
+ manifest={'configs':cells,'rounds':a.rounds,'settle_seconds':a.settle_seconds,'model':str(model),'model_sha256':MODEL_SHA,'sidecar':str(sidecar),'sidecar_stat':{'size':sidecar.stat().st_size,'mtime_ns':sidecar.stat().st_mtime_ns},'binary_sha256':sha(binary),'driver_sha256':sha(__file__),'selftest_sha256':sha(PKG/'bin/moe-tiled-selftest'),'offsets_sha256':sha(PKG/'share/gguf_expert_offsets.csv'),'scope':'same model/input/context/threads and22 expert slots; different policies may change IO work; paired raw/tile same profile must preserve work'}
+ if (out/'manifest.json').exists():need(json.loads((out/'manifest.json').read_text())==manifest,'resume manifest differs')
+ else:save(out/'manifest.json',manifest)
+ save(out/'host.json',{'uname':probe(['/usr/bin/uname','-a']),'hardware':probe(['/usr/sbin/sysctl','hw.memsize','hw.model','hw.ncpu','machdep.cpu.brand_string']),'thermal':probe(['/usr/bin/pmset','-g','therm'])})
+ with (out/'selftest.log').open('w') as log:subprocess.run([str(PKG/'bin/moe-tiled-selftest')],stdout=log,stderr=log,check=True)
+ prompt=out/'prompt.txt';prompt.write_text(PROMPT)
+ def check(d,st,c):
+  need(len(d['generated_tokens']) in (128,600) and len(d['routes'])==d['decode_calls']*40,'route/token coverage')
+  for k in ('duplicate_reads','prefetch_failed','shadow_fail','direct_verify_fail','ov_verify_fail','direct_fallback_calls','direct_materialize_bytes','direct_repack_bytes','stage_bytes'):need(st[k]==0,f'{c["id"]}: {k}')
+  need(st['expert_layout']==c['layout'] and st['policy']==c['policy'],'native layout/policy differs')
+  need(st['demand_slots']==c['M'] and st['demand_slots']+st['probation_slots']==22,'cache budget differs')
+  need(st['prefetch_enabled']==bool(c['prefetch']) and st['probation_slots']==c['P'],'native prefetch differs')
+  if not c['prefetch']:need(st['prefetch_read_bytes']==st['prefetch_submitted_seq_n']==0,'P0 did speculative work')
+  if not c['overlap']:need(st['ov_experts']==0,'disabled overlap did work')
+  else:need(st['ov_experts']>0,'enabled overlap never computed early')
+  if c['layout']=='tile16':need(st['tile_rows']==d['decode_calls']*983040 and st['tile_inverse_fallback_chunks']==0,'tile coverage/fallback');need(st['tile_early_chunks']==st['ov_experts']*3,'early compute coverage')
+ def run(c,label,n,reference=None,write=False):
+  directory=out/('exact' if reference else 'speed');directory.mkdir(exist_ok=True);base=directory/label;ctxfile=base.with_suffix('.context.json')
+  if ctxfile.exists():
+   ctx=json.loads(ctxfile.read_text());need(ctx.get('complete'),'incomplete run: inspect logs/process before moving files to an excluded directory')
+   need(not reference,'restart incomplete exact stage in a fresh output directory')
+   d=json.loads(base.with_suffix('.json').read_text());st=json.loads(base.with_suffix('.stats.json').read_text());check(d,st,c);return d,st,ctx
+  env={k:v for k,v in os.environ.items() if not k.startswith(('LLAMA_MOE','RESEARCH_','MOE_TELEMETRY'))}
+  env.update(LLAMA_MOE_PAGING_M=str(c['M']),LLAMA_MOE_PAGING_STAGE_MODE='persistent_overlap',LLAMA_MOE_PAGING_COMPUTE_MODE='direct_sparse',LLAMA_MOE_PAGING_POLICY=c['policy'],LLAMA_MOE_PAGING_BACKEND='gguf3',LLAMA_MOE_PAGING_QD='4',LLAMA_MOE_PAGING_NOCACHE='1',LLAMA_MOE_PAGING_GGUF=str(sidecar if c['layout']=='tile16' else model),LLAMA_MOE_PAGING_OFFSETS=str(PKG/'share/gguf_expert_offsets.csv'),LLAMA_MOE_PAGING_PREFETCH_MODE='a0' if c['prefetch'] else 'off',LLAMA_MOE_PAGING_PREFETCH_P=str(c['P']),LLAMA_MOE_PAGING_PREFETCH_K='16',LLAMA_MOE_PAGING_PREFETCH_SHARED='1',LLAMA_MOE_PAGING_PREFETCH_ADMISSION='all',LLAMA_MOE_PAGING_OVERLAP=str(c['overlap']),LLAMA_MOE_PAGING_OVERLAP_THREADS='4',LLAMA_MOE_PAGING_OVERLAP_VERIFY='0',LLAMA_MOE_PAGING_LAYOUT=c['layout'],LLAMA_MOE_PAGING_STATS=str(base.with_suffix('.stats.json')),LLAMA_MOE_PAGING_STATS_INTERVAL='0',LLAMA_MOE_PAGING_TIMING='0',MOE_TELEMETRY='off',RESEARCH_THREADS='4',RESEARCH_SETTLE_SECONDS=str(0 if reference else a.settle_seconds),RESEARCH_PHASE_FILE=str(base.with_suffix('.phase')))
+  if reference:env['RESEARCH_REFERENCE_WRITE' if write else 'RESEARCH_REFERENCE_READ']=str(reference)
+  argv=['/usr/bin/time','-l',str(binary),str(model),str(prompt),str(n),str(int(c['layout']=='tile16')),str(base.with_suffix('.json'))];before=snapshot();thermal=probe(['/usr/bin/pmset','-g','therm']);samples=[];stop=threading.Event()
+  def monitor():
+   while not stop.is_set():
+    s=snapshot();phase=base.with_suffix('.phase');s['phase']=phase.read_text() if phase.exists() else 'startup/settle/prefill';samples.append(s);stop.wait(5)
+  thread=threading.Thread(target=monitor);t0=time.monotonic();print('RUN',label,flush=True)
+  with base.with_suffix('.log').open('w') as log:
+   proc=subprocess.Popen(argv,env=env,stdout=log,stderr=log);save(ctxfile,{'complete':False,'process_pid':proc.pid,'argv':argv,'config':c});thread.start()
+   try:rc=proc.wait(timeout=3600)
+   finally:
+    if proc.poll() is None:proc.terminate();proc.wait(timeout=30)
+    stop.set();thread.join()
+  wall=time.monotonic()-t0;after=snapshot();save(base.with_suffix('.memory.json'),{'before':before,'samples':samples,'after':after,'scope':'5s system-wide VM/swap; observer enabled identically; no physical disk attribution'})
+  need(rc==0,f'{label}: process exit{rc}, see log')
+  d=json.loads(base.with_suffix('.json').read_text());st=json.loads(base.with_suffix('.stats.json').read_text());check(d,st,c)
+  log=base.with_suffix('.log').read_text();rss=re.findall(r'^\s*(\d+)\s+maximum resident set size',log,re.M);need(len(rss)==1,'missing time -l RSS')
+  ctx={'complete':True,'config':c,'argv':argv,'env_overrides':{k:v for k,v in env.items() if k.startswith(('LLAMA_MOE','RESEARCH_','MOE_TELEMETRY'))},'process_wall_seconds':wall,'generation_tps':n*1000/d['generation_loop_wall_ms'],'generation_cpu_per_wall':d['generation_cpu_ms']/d['generation_loop_wall_ms'],'maximum_resident_set_bytes':int(rss[0]),'thermal_before':thermal,'system_swap_peak_bytes':max([s['swap_used_bytes'] for s in samples+[before,after] if s['swap_used_bytes'] is not None],default=None),'system_swap_before_bytes':before['swap_used_bytes'],'system_swap_after_bytes':after['swap_used_bytes'],'wait_ms_per_model_pass':st['demand_blocking_wait_ms']/d['decode_calls'],'achieved_overlap_ms_per_model_pass':st['ov_achieved_ms']/d['decode_calls'],'early_cpu_ms_per_model_pass':st['ov_cpu_ms']/d['decode_calls'],'duplicated_cpu_proxy_ms_per_model_pass':st['ov_dup_cpu_proxy_ms']/d['decode_calls'],'startup_admission_bytes':st['tile_admission_bytes'],'startup_admission_ms':st['tile_admission_ms']};save(ctxfile,ctx);print('DONE',label,round(ctx['generation_tps'],4),flush=True);return d,st,ctx
+ def identical(b,c,same_profile=False):
+  need(b[0]['generated_tokens']==c[0]['generated_tokens'] and b[0]['routes']==c[0]['routes'],'inference mismatch: STOP')
+  if same_profile:
+   for k in ('logical_demand_hits','logical_demand_misses','logical_demand_bytes','ordinary_demand_read_bytes','prefetch_read_bytes','total_read_bytes','prefetch_submitted_seq_hash','prefetch_submitted_seq_n'):need(b[1][k]==c[1][k],f'same-profile work mismatch: {k}')
+ if a.stage in ('exact','all') and not (out/'exact.json').exists():
+  with tempfile.TemporaryDirectory(prefix='reference-',dir=out) as td:
+   ref=pathlib.Path(td)/'canonical.bin';gold=run(cells[0],'canonical',128,ref,True);proof=[]
+   for c in cells:
+    x=run(c,c['id'],128,ref);identical(gold,x);need(x[0]['exact_tensor_bytes']==x[0]['decode_calls']*3932160,'byte comparison incomplete');proof.append({'config':c,'byte_exact_output_bytes':x[0]['exact_tensor_bytes'],'tokens_identical':True,'ordered_routes_identical':True})
+   save(out/'exact.json',{'complete':True,'canonical_config':cells[0],'cases':proof})
+ if a.stage in ('speed','all'):
+  need((out/'exact.json').exists() and json.loads((out/'exact.json').read_text())['complete'],'run --stage exact first')
+  rows=[]
+  for r in range(a.rounds):
+   order=cells[(4*r)%16:]+cells[:(4*r)%16]
+   if r%2:order=list(reversed(order))
+   arms={}
+   for c in order:arms[c['id']]=run(c,f'r{r}_{c["id"]}',600)
+   gold=arms[cells[0]['id']]
+   for c in cells:identical(gold,arms[c['id']])
+   for j in range(0,16,2):identical(arms[cells[j]['id']],arms[cells[j+1]['id']],True)
+   rows.append({'round':r,'order':[c['id'] for c in order],'configs':{key:val[2] for key,val in arms.items()},'tokens_routes_identical':True,'raw_tile_same_profile_work_identical':True});save(out/'rounds.json',{'complete':len(rows)==a.rounds,'rounds':rows})
+  ranks=[]
+  for c in cells:
+   rates=[r['configs'][c['id']]['generation_tps'] for r in rows];ratio=[r['configs'][c['id']]['generation_tps']/r['configs'][cells[0]['id']]['generation_tps'] for r in rows]
+   ranks.append({'config':c,'median_tps':statistics.median(rates),'round_tps':rates,'median_ratio_to_raw_lru_pf0_ov0':statistics.median(ratio),'HIGH_VARIANCE':min(ratio)<.9 and max(ratio)>1.1,'rss_peak_bytes':max(r['configs'][c['id']]['maximum_resident_set_bytes'] for r in rows),'swap_peak_bytes':max((r['configs'][c['id']]['system_swap_peak_bytes'] for r in rows if r['configs'][c['id']]['system_swap_peak_bytes'] is not None),default=None)})
+  ranks.sort(key=lambda x:x['median_tps'],reverse=True);save(out/'summary.json',{'complete':True,'ranking':ranks,'scope':'policy/prefetch variants change IO work; equal expert-cache bytes; M5 result does not predict M1 winner; inspect swaps/thermal/order and per-round results'})
+  print('RANKING',[(x['config']['id'],round(x['median_tps'],3)) for x in ranks],flush=True)
+ # Archive only after all requested stages finish; temporary reference already removed.
+ subprocess.run(['/usr/bin/tar','czf',str(out)+'.bundle.tar.gz','-C',str(out.parent),out.name],check=True)
+ print('RESULTS',str(out)+'.bundle.tar.gz',flush=True)
+if __name__=='__main__':main()

@@ -1,0 +1,581 @@
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -34,6 +34,7 @@
+     llama-memory-recurrent.cpp
+     llama-mmap.cpp
+     llama-moe-paging.cpp
++    llama-moe-tiled.cpp
+     llama-model-loader.cpp
+     llama-model-saver.cpp
+     llama-model.cpp
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -1,4 +1,9 @@
+ #include "llama-moe-paging.h"
++#include "llama-moe-tiled.h"
++#include <array>
++#ifdef __APPLE__
++#include <CommonCrypto/CommonDigest.h>
++#endif
+ #include "llama-moe-observe.h"
+ 
+ #include "llama-impl.h"
+@@ -145,6 +150,11 @@
+     std::string stage_mode;  // serial | overlap | persistent_overlap
+     std::string compute_mode; // staging | direct_sparse
+     std::string backend;     // packed | gguf3
++    bool tile16 = false;
++    struct alignas(64) tile_metrics { uint64_t chunks=0, rows=0, fallback_chunks=0; };
++    std::array<tile_metrics, 24> tile_counts{}; // graph workers0..15, resident lanes16..23
++    uint64_t tile_admission_bytes = 0;
++    double tile_admission_ms = 0;
+     std::string stats_path;
+     int  qd = 4;
+     bool hot = false;
+@@ -1012,6 +1022,21 @@
+     fprintf(f, " \"fault_ms\": %.3f,\n", fault_ms);
+     fprintf(f, " \"read_wait_ms\": %.3f,\n", read_wait_ms);
+     fprintf(f, " \"compute_mode\": \"%s\",\n", g.compute_mode.c_str());
++    uint64_t tile_chunks=0, tile_rows=0, tile_fallback=0, tile_early_chunks=0;
++    for (int lane=0; lane<24; ++lane) {
++        tile_chunks += g.tile_counts[lane].chunks; tile_rows += g.tile_counts[lane].rows;
++        tile_fallback += g.tile_counts[lane].fallback_chunks;
++        if (lane>=16) { tile_early_chunks += g.tile_counts[lane].chunks; }
++    }
++    fprintf(f, " \"expert_layout\": \"%s\",\n", g.tile16 ? "tile16" : "raw");
++    fprintf(f, " \"tile_chunks\": %llu,\n", (unsigned long long) tile_chunks);
++    fprintf(f, " \"tile_early_chunks\": %llu,\n", (unsigned long long) tile_early_chunks);
++    fprintf(f, " \"tile_rows\": %llu,\n", (unsigned long long) tile_rows);
++    fprintf(f, " \"tile_inverse_fallback_chunks\": %llu,\n", (unsigned long long) tile_fallback);
++    fprintf(f, " \"tile_counter_bytes\": %zu,\n", sizeof(g.tile_counts));
++    fprintf(f, " \"tile_inverse_scratch_bytes_per_lane\": %d,\n", g.tile16 ? 1152 : 0);
++    fprintf(f, " \"tile_admission_bytes\": %llu,\n", (unsigned long long) g.tile_admission_bytes);
++    fprintf(f, " \"tile_admission_ms\": %.3f,\n", g.tile_admission_ms);
+     fprintf(f, " \"direct_calls\": %llu,\n", (unsigned long long) direct_calls);
+     fprintf(f, " \"direct_mul_mat_id_calls\": %llu,\n", (unsigned long long) direct_mmid);
+     fprintf(f, " \"direct_selected_matrices\": %llu,\n", (unsigned long long) direct_sel);
+@@ -1990,6 +2015,71 @@
+     g.shadow_checks++;
+ }
+ 
++// One representation-aware leaf shared by normal and already-ready expert work.
++// It never reads another expert file or materializes an original component.
++void tile_compute(const char * packed, const void * q8, float * out,
++                  int rows, int blocks, bool q6, ggml_vec_dot_t native_dot, int lane) {
++    GGML_ASSERT(lane >= 0 && lane < 24 && rows > 0 && rows % 16 == 0 && blocks <= 8);
++    auto & metric = g.tile_counts[lane];
++    ++metric.chunks; metric.rows += rows;
++    if (!moe_tiled_dot((const uint8_t *) packed, q8, out, rows, blocks, 16, q6)) {
++        ++metric.fallback_chunks;
++        alignas(16) std::array<uint8_t, 1152> scratch;
++        if (!moe_tiled_reference_dot((const uint8_t *) packed, q8, out, rows, blocks,
++                                    16, q6, native_dot, scratch.data(), scratch.size())) {
++            GGML_ABORT("tile16 inverse-row fallback rejected geometry");
++        }
++    }
++}
++
++void tile_admit() {
++#ifdef __APPLE__
++    // This version supports exactly the audited Qwen GGUF and bijective tile16 file.
++    // No environment variable can disable or replace the full payload SHA check.
++    constexpr const char * model_sha = "f5ee307a2982106a6eb82b62b2c00b575c9072145a759ae4660378acda8dcf2d";
++    constexpr const char * sidecar_sha = "e3dfd7ff1c930f665bdd45f45615d40eeaef40cede7f4eb8dfda1808dcf2d245";
++    constexpr const char * offsets_sha = "d0634f26c62a91a1d6157f117cd10e8c59f62c2ce39e3bcf221f5b1f27ef90d9";
++    const double t0 = now_ms();
++    std::array<uint8_t, 4096> header{};
++    struct stat before{}, after{};
++    if (fstat(g.gguf_fd, &before) || before.st_size != 23938321664LL ||
++        (before.st_mode & 0222) || pread(g.gguf_fd, header.data(), header.size(), 0) != ssize_t(header.size())) {
++        GGML_ABORT("tile16 requires the completed read-only supported sidecar");
++    }
++    const uint32_t expected[4] = {1, 16, 30720, 108};
++    if (memcmp(header.data(), "MOETIL16", 8) || memcmp(header.data()+8, expected, sizeof(expected)) ||
++        memcmp(header.data()+32, model_sha, 64)) { GGML_ABORT("tile16 sidecar header/model mismatch"); }
++    auto hash_fd = [&](int fd, uint64_t bytes) {
++        std::array<uint8_t, 262144> buffer{}; CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
++        for (uint64_t pos = 0; pos < bytes;) {
++            const size_t count = std::min<uint64_t>(buffer.size(), bytes-pos);
++            const ssize_t got = pread(fd, buffer.data(), count, pos);
++            if (got <= 0) { GGML_ABORT("tile16 admission read failed"); }
++            CC_SHA256_Update(&ctx, buffer.data(), CC_LONG(got)); pos += uint64_t(got);
++        }
++        std::array<uint8_t, 32> digest{}; CC_SHA256_Final(digest.data(), &ctx);
++        std::string result; for (auto x : digest) { result += "0123456789abcdef"[x>>4]; result += "0123456789abcdef"[x&15]; }
++        return result;
++    };
++    if (hash_fd(g.gguf_fd, before.st_size) != sidecar_sha) { GGML_ABORT("tile16 payload SHA mismatch"); }
++    const std::string offsets = getenv_str("LLAMA_MOE_PAGING_OFFSETS", "results/gguf_expert_offsets.csv");
++    const int fd = open(offsets.c_str(), O_RDONLY); struct stat csv{};
++    if (fd < 0 || fstat(fd, &csv) || hash_fd(fd, csv.st_size) != offsets_sha) { GGML_ABORT("tile16 offsets SHA mismatch"); }
++    close(fd);
++    if (fstat(g.gguf_fd, &after) || before.st_size != after.st_size ||
++        before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec || before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
++        before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec || before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec) {
++        GGML_ABORT("tile16 artifact changed during admission");
++    }
++    g.tile_admission_bytes = uint64_t(before.st_size) + uint64_t(csv.st_size);
++    g.tile_admission_ms = now_ms()-t0;
++    LLAMA_LOG_INFO("tile16: complete immutable payload admission %.3f ms (%llu bytes, startup only)\n",
++                   g.tile_admission_ms, (unsigned long long)g.tile_admission_bytes);
++#else
++    GGML_ABORT("tile16 verified sidecar admission currently requires macOS");
++#endif
++}
++
+ // Authoritative demand event under protected probation.
+ // Execution 017 Part D: exact full contribution of the already-ready selected experts,
+ // computed while the authoritative cold reads are in flight. Raw down outputs are stored
+@@ -2052,10 +2142,15 @@
+             const char * gw = (const char *) wg->data + (size_t) slots[i] * wg->nb[2];
+             const char * uw = (const char *) wu->data + (size_t) slots[i] * wu->nb[2];
+             const char * dw = (const char *) wd->data + (size_t) slots[i] * wd->nb[2];
++            if (g.tile16) {
++                tile_compute(gw, g.ov_inbuf.data(), gate, n_ff, n_in/256, false, vg, 16+lane);
++                tile_compute(uw, uv == gv ? g.ov_inbuf.data() : g.ov_upinbuf.data(), up, n_ff, n_in/256, false, vu, 16+lane);
++            } else {
+             for (int r = 0; r < n_ff; ++r) {
+                 vg(n_in, gate + r, 0, gw + r * wg->nb[1], 0, g.ov_inbuf.data(), 0, 1);
+                 vu(n_in, up + r, 0, uw + r * wu->nb[1], 0,
+                    uv == gv ? g.ov_inbuf.data() : g.ov_upinbuf.data(), 0, 1);
++            }
+             }
+             l.early_act_start[i] = now_ms();
+             ggml_vec_swiglu_f32(n_ff, act, gate, up);
+@@ -2063,7 +2158,8 @@
+             auto * cd = g.ov_actbuf.data() + (size_t) i * rs_d;
+             ggml_get_type_traits_cpu(dv)->from_float(act, cd, n_ff);
+             float * out = l.early_out.data() + (size_t) i * n_emb;
+-            for (int r = 0; r < n_emb; ++r) { vd(n_ff, out + r, 0, dw + r * wd->nb[1], 0, cd, 0, 1); }
++            if (g.tile16) { tile_compute(dw, cd, out, n_emb, n_ff/256, true, vd, 16+lane); }
++            else { for (int r = 0; r < n_emb; ++r) { vd(n_ff, out + r, 0, dw + r * wd->nb[1], 0, cd, 0, 1); } }
+             l.early_end[i] = now_ms();
+             if (observer.mode) { moe_observe_record r; r.type=5; r.step=g.tokens; r.layer=l.il;
+                 r.expert=(size_t)slots[i]<l.slot_expert.size()?l.slot_expert[slots[i]]:-1; r.component=i; r.worker=lane;
+@@ -3197,6 +3293,9 @@
+     g.backend = getenv_str("LLAMA_MOE_PAGING_BACKEND", "packed");
+     g.qd      = std::max(1, std::min(16, getenv_int("LLAMA_MOE_PAGING_QD", 4)));
+     g.hot     = getenv_bool("LLAMA_MOE_PAGING_HOT", false);
++    const std::string layout = getenv_str("LLAMA_MOE_PAGING_LAYOUT", "raw");
++    if (layout != "raw" && layout != "tile16") { GGML_ABORT("invalid expert layout"); }
++    g.tile16 = layout == "tile16";
+     g.nocache_requested = getenv_bool("LLAMA_MOE_PAGING_NOCACHE", false);
+     g.assert_checks = getenv_bool("LLAMA_MOE_PAGING_ASSERT", false);
+     g.timing = getenv_bool("LLAMA_MOE_PAGING_TIMING", true);
+@@ -3307,6 +3406,14 @@
+         g.nocache_applied = any;
+     }
+ 
++    if (g.tile16) {
++        if (g.backend != "gguf3" || g.compute_mode != "direct_sparse" || g.hot || g.direct_verify ||
++            g.n_layer != 40 || g.n_expert != 256 || g.k_slots != 8) {
++            GGML_ABORT("tile16 requires supported model, gguf3/direct_sparse/hot=0/direct_verify=0");
++        }
++        tile_admit();
++    }
++
+     g.cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+     if (g.cpu == nullptr) {
+         LLAMA_LOG_WARN("%s: no CPU backend, paging disabled\n", __func__);
+@@ -3381,6 +3488,12 @@
+         auto * dt = model.layers[il].ffn_down_exps;
+         if (gt == nullptr || ut == nullptr || dt == nullptr) {
+             continue;
++        }
++
++        if (g.tile16 && (gt->type != GGML_TYPE_Q4_K || ut->type != GGML_TYPE_Q4_K || dt->type != GGML_TYPE_Q6_K ||
++            gt->ne[0] != 2048 || ut->ne[0] != 2048 || dt->ne[0] != 512 ||
++            gt->ne[1] != 512 || ut->ne[1] != 512 || dt->ne[1] != 2048)) {
++            GGML_ABORT("tile16 model expert geometry mismatch");
+         }
+ 
+         // direct storage never materializes a K8 tensor, so it allocates no staging
+@@ -3801,8 +3914,16 @@
+ 
+     // decode scope: single token, K selected ids
+     if (ids->ne[1] != 1 || n_ids > MAX_K) {
++        if (g.tile16) { GGML_ABORT("tile16 invalid selected id geometry"); }
+         if (ith == 0) { l->direct_fallback_calls++; }
+         return false;
++    }
++
++    if (g.tile16 && (nth < 1 || nth > 16 || n_ids != 8 || ids->ne[1] != 1 ||
++        src1->type != GGML_TYPE_F32 || vec_dot_type != GGML_TYPE_Q8_K || ne12 != 1 ||
++        ne11 != (src0 == l->slot_down ? 8 : 1) || ne10 != ne00 || ne01 % 16 != 0 ||
++        params->wdata == nullptr || params->wsize < ggml_row_size(vec_dot_type, ne10)*size_t(ne11)*size_t(ne12))) {
++        GGML_ABORT("tile16 unsupported direct matmul geometry; no raw-layout fallback");
+     }
+ 
+     // Resolve the K selected resident-slot ids, reject duplicates, sort ascending
+@@ -3812,6 +3933,7 @@
+     for (int i = 0; i < n_ids; i++) {
+         const int32_t s = *(const int32_t *) ((const char *) ids->data + i * ids->nb[0]);
+         if (s < 0 || s >= n_as) {
++            if (g.tile16) { GGML_ABORT("tile16 invalid resident slot"); }
+             if (ith == 0) { l->direct_fallback_calls++; }
+             return false;
+         }
+@@ -3821,6 +3943,7 @@
+     for (int i = 0; i < n_ids; i++) {
+         for (int q = i + 1; q < n_ids; q++) {
+             if (sel[order[i]] == sel[order[q]]) {
++                if (g.tile16) { GGML_ABORT("tile16 duplicate resident slot"); }
+                 // duplicate resident slot: the normal grouping merges them, keep it
+                 if (ith == 0) { l->direct_fallback_calls++; }
+                 return false;
+@@ -3899,6 +4022,14 @@
+                 : wbuf + (size_t) i11 * nbw1;
+             float * dst_col = (float *) ((char *) dst->data + (size_t) j * nb1);
+ 
++            if (g.tile16) {
++                const int tiles = (int(nr0)/16 + nth-1)/nth;
++                const int begin = std::min(int(nr0), ith*tiles*16);
++                const int end = std::min(int(nr0), begin+tiles*16);
++                if (begin < end) { tile_compute(src0_cur + size_t(begin)*nb01, src1_row, dst_col+begin,
++                                               end-begin, int(ne00)/256, type==GGML_TYPE_Q6_K,
++                                               ggml_get_type_traits_cpu(type)->vec_dot, ith); }
++            } else {
+             (void) chunk_size;
+             for (int64_t ic = ith; ic < nchunk0; ic += nth) {
+                 const int64_t ir0_start = dr0 * ic;
+@@ -3909,6 +4040,7 @@
+                     vec_dot(ne00, &tmp, 0, src0_cur + ir0 * nb01, 0, src1_row, 0, 1);
+                     dst_col[ir0] = tmp;
+                 }
++            }
+             }
+             if(capture) { moe_observe_record r; r.type=1; r.step=l->events?l->events-1:0;
+                 r.layer=l->il; r.expert=(size_t)s<l->slot_expert.size()?l->slot_expert[s]:-1;
+--- /dev/null
++++ b/src/llama-moe-tiled.cpp
+@@ -0,0 +1,318 @@
++#include "llama-moe-tiled.h"
++#define GGML_COMMON_DECL_CPP
++#include "ggml-common.h"
++#include "simd-mappings.h"
++#include <cassert>
++#include <cmath>
++#include <cstring>
++
++static unsigned quant(const uint8_t *b, int i, bool q6) {
++    if (!q6)
++        return (b[16 + 32 * (i / 64) + i % 32] >> (4 * ((i % 64) / 32))) & 15;
++    const int h = i / 128, p = i % 128;
++    return ((b[64 * h + p % 64] >> (4 * (p / 64))) & 15) |
++           (((b[128 + 32 * h + p % 32] >> (2 * (p / 32))) & 3) << 4);
++}
++static void set_quant(uint8_t *b, int i, unsigned x, bool q6) {
++    if (!q6) {
++        b[16 + 32 * (i / 64) + i % 32] |= x << (4 * ((i % 64) / 32));
++        return;
++    }
++    int h = i / 128, p = i % 128;
++    b[64 * h + p % 64] |= (x & 15) << (4 * (p / 64));
++    b[128 + 32 * h + p % 32] |= (x >> 4) << (2 * (p / 32));
++}
++void moe_tiled_pack(const uint8_t *raw, uint8_t *out, int rows, int nb, int nr, bool q6) {
++    const int sz = q6 ? 210 : 144, nh = q6 ? 18 : 16;
++    std::memset(out, 0, size_t(rows) * nb * sz);
++    for (int t = 0; t < rows / nr; ++t)
++        for (int bp = 0; bp < nb; ++bp) {
++            auto *d = out + (t * nb + bp) * nr * sz;
++            for (int r = 0; r < nr; ++r) {
++                const auto *b = raw + ((t * nr + r) * nb + bp) * sz;
++                if (!q6) {
++                    std::memcpy(d + 4 * r, b, 4);
++                    for (int c = 4; c < 16; ++c)
++                        d[c * nr + r] = b[c];
++                } else {
++                    for (int c = 0; c < 16; ++c)
++                        d[c * nr + r] = b[192 + c];
++                    std::memcpy(d + 16 * nr + 2 * r, b + 208, 2);
++                }
++                for (int p = 0; p < 64; ++p)
++                    for (int j = 0; j < 4; ++j) {
++                        unsigned x = quant(b, 4 * p + j, q6);
++                        int f = 4 * r + j;
++                        auto *a = d + nh * nr + p * (q6 ? 3 : 2) * nr;
++                        a[f % (2 * nr)] |= (x & 15) << (4 * (f / (2 * nr)));
++                        if (q6)
++                            a[2 * nr + f % nr] |= (x >> 4) << (2 * (f / nr));
++                    }
++            }
++        }
++}
++void moe_tiled_unpack(const uint8_t *in, uint8_t *raw, int rows, int nb, int nr, bool q6) {
++    const int sz = q6 ? 210 : 144, nh = q6 ? 18 : 16;
++    std::memset(raw, 0, size_t(rows) * nb * sz);
++    for (int t = 0; t < rows / nr; ++t)
++        for (int bp = 0; bp < nb; ++bp) {
++            auto *d = in + (t * nb + bp) * nr * sz;
++            for (int r = 0; r < nr; ++r) {
++                auto *b = raw + ((t * nr + r) * nb + bp) * sz;
++                if (!q6) {
++                    std::memcpy(b, d + 4 * r, 4);
++                    for (int c = 4; c < 16; ++c)
++                        b[c] = d[c * nr + r];
++                } else {
++                    for (int c = 0; c < 16; ++c)
++                        b[192 + c] = d[c * nr + r];
++                    std::memcpy(b + 208, d + 16 * nr + 2 * r, 2);
++                }
++                for (int p = 0; p < 64; ++p)
++                    for (int j = 0; j < 4; ++j) {
++                        int f = 4 * r + j;
++                        auto *a = d + nh * nr + p * (q6 ? 3 : 2) * nr;
++                        unsigned x = (a[f % (2 * nr)] >> (4 * (f / (2 * nr)))) & 15;
++                        if (q6)
++                            x |= ((a[2 * nr + f % nr] >> (2 * (f / nr))) & 3) << 4;
++                        set_quant(b, 4 * p + j, x, q6);
++                    }
++            }
++        }
++}
++
++#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_SVE)
++#include <arm_neon.h>
++template <int N> static inline uint8x16_t col(const uint8_t *b, int c) {
++    if constexpr (N == 16)
++        return vld1q_u8(b + c * N);
++    else
++        return vcombine_u8(vld1_u8(b + c * N), vdup_n_u8(0));
++}
++template <int N> static inline void decode(const uint8_t *p, bool q6, int8x16_t *w) {
++    const auto mask = vdupq_n_u8(15);
++    const auto lo0 = vld1q_u8(p);
++    if constexpr (N == 16) {
++        const auto lo1 = vld1q_u8(p + 16);
++        uint8x16_t a[4] = {vandq_u8(lo0, mask), vandq_u8(lo1, mask), vshrq_n_u8(lo0, 4), vshrq_n_u8(lo1, 4)};
++        if (q6) {
++            const auto h = vld1q_u8(p + 32);
++            const auto m = vdupq_n_u8(3);
++            a[0] = vorrq_u8(a[0], vshlq_n_u8(vandq_u8(h, m), 4));
++            a[1] = vorrq_u8(a[1], vshlq_n_u8(vandq_u8(vshrq_n_u8(h, 2), m), 4));
++            a[2] = vorrq_u8(a[2], vshlq_n_u8(vandq_u8(vshrq_n_u8(h, 4), m), 4));
++            a[3] = vorrq_u8(a[3], vshlq_n_u8(vshrq_n_u8(h, 6), 4));
++        }
++        for (int i = 0; i < 4; ++i)
++            w[i] = vreinterpretq_s8_u8(a[i]);
++    } else {
++        auto a = vandq_u8(lo0, mask), b = vshrq_n_u8(lo0, 4);
++        if (q6) {
++            const auto h = vld1_u8(p + 16), m = vdup_n_u8(3);
++            auto h0 = vcombine_u8(vand_u8(h, m), vand_u8(vshr_n_u8(h, 2), m));
++            auto h1 = vcombine_u8(vand_u8(vshr_n_u8(h, 4), m), vshr_n_u8(h, 6));
++            a = vorrq_u8(a, vshlq_n_u8(h0, 4));
++            b = vorrq_u8(b, vshlq_n_u8(h1, 4));
++        }
++        w[0] = vreinterpretq_s8_u8(a);
++        w[1] = vreinterpretq_s8_u8(b);
++    }
++}
++
++template <int L, bool Q6>
++static inline float32x4_t continue_lane(float32x4_t state, int32x4_t a, int32x4_t b, const uint8_t *h,
++                                        float yd) {
++    ggml_half hd, hm;
++    std::memcpy(&hd, h, 2);
++    float sum = vgetq_lane_f32(state, L);
++    if constexpr (!Q6) {
++        std::memcpy(&hm, h + 2, 2);
++        const float d = yd * GGML_CPU_FP16_TO_FP32(hd);
++        const float dmin = yd * GGML_CPU_FP16_TO_FP32(hm);
++        sum -= dmin * vgetq_lane_s32(b, L);
++        sum += d * vgetq_lane_s32(a, L);
++    } else {
++        const float d_all = GGML_CPU_FP16_TO_FP32(hd);
++        sum += d_all * yd * vgetq_lane_s32(a, L);
++    }
++    return vsetq_lane_f32(sum, state, L);
++}
++
++template <int N, bool Q6>
++__attribute__((noinline)) static void kernel(const uint8_t *in, const block_q8_K *y, float *out, int rows,
++                                             int nb) {
++    constexpr int V = N / 4, SZ = Q6 ? 210 : 144, NH = Q6 ? 18 : 16, NG = Q6 ? 16 : 8, NQ = Q6 ? 4 : 8;
++    for (int t = 0; t < rows / N; ++t) {
++        float32x4_t sums[V];
++        for (auto &s : sums)
++            s = vdupq_n_f32(0);
++        for (int bp = 0; bp < nb; ++bp) {
++            const auto *block = in + (t * nb + bp) * N * SZ;
++            const auto *payload = block + N * NH;
++            int32x4_t A[V], B[V];
++            for (int i = 0; i < V; ++i)
++                A[i] = B[i] = vdupq_n_s32(0);
++            for (int g = 0; g < NG; ++g) {
++                int32x4_t dot[V];
++                for (auto &v : dot)
++                    v = vdupq_n_s32(0);
++                for (int p = 0; p < NQ; ++p) {
++                    int8x16_t w[V];
++                    decode<N>(payload + (g * NQ + p) * (Q6 ? 3 : 2) * N, Q6, w);
++                    int32_t quad;
++                    std::memcpy(&quad, y[bp].qs + (g * NQ + p) * 4, 4);
++                    auto q = vreinterpretq_s8_s32(vdupq_n_s32(quad));
++                    for (int i = 0; i < V; ++i)
++                        dot[i] = vdotq_s32(dot[i], w[i], q);
++                }
++                uint8x16_t s, m;
++                if constexpr (Q6) {
++                    s = col<N>(block, g);
++                    m = s;
++                } else if (g < 4) {
++                    s = vandq_u8(col<N>(block, 4 + g), vdupq_n_u8(63));
++                    m = vandq_u8(col<N>(block, 8 + g), vdupq_n_u8(63));
++                } else {
++                    auto x = col<N>(block, g), yy = col<N>(block, g + 4), z = col<N>(block, g + 8);
++                    s = vorrq_u8(vandq_u8(z, vdupq_n_u8(15)), vshlq_n_u8(vshrq_n_u8(x, 6), 4));
++                    m = vorrq_u8(vshrq_n_u8(z, 4), vshlq_n_u8(vshrq_n_u8(yy, 6), 4));
++                }
++                int16x8_t ss[2], mm[2];
++                if constexpr (Q6) {
++                    ss[0] = vmovl_s8(vreinterpret_s8_u8(vget_low_u8(s)));
++                    ss[1] = vmovl_s8(vreinterpret_s8_u8(vget_high_u8(s)));
++                    mm[0] = ss[0];
++                    mm[1] = ss[1];
++                } else {
++                    ss[0] = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(s)));
++                    ss[1] = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(s)));
++                    mm[0] = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(m)));
++                    mm[1] = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(m)));
++                }
++                int16_t bs = Q6 ? y[bp].bsums[g] : y[bp].bsums[2 * g] + y[bp].bsums[2 * g + 1];
++                for (int i = 0; i < V; ++i) {
++                    auto sc = (i % 2) ? vget_high_s16(ss[i / 2]) : vget_low_s16(ss[i / 2]);
++                    auto mi = (i % 2) ? vget_high_s16(mm[i / 2]) : vget_low_s16(mm[i / 2]);
++                    A[i] = vmlaq_s32(A[i], dot[i], vmovl_s16(sc));
++                    B[i] = vmlal_s16(B[i], mi, vdup_n_s16(bs));
++                }
++            }
++            for (int i = 0; i < V; ++i) {
++                if constexpr (Q6)
++                    A[i] = vsubq_s32(A[i], vshlq_n_s32(B[i], 5));
++                auto *h = block + (Q6 ? 16 * N + 8 * i : 16 * i);
++                constexpr int STEP = Q6 ? 2 : 4;
++                sums[i] = continue_lane<0, Q6>(sums[i], A[i], B[i], h, y[bp].d);
++                sums[i] = continue_lane<1, Q6>(sums[i], A[i], B[i], h + STEP, y[bp].d);
++                sums[i] = continue_lane<2, Q6>(sums[i], A[i], B[i], h + 2 * STEP, y[bp].d);
++                sums[i] = continue_lane<3, Q6>(sums[i], A[i], B[i], h + 3 * STEP, y[bp].d);
++            }
++        }
++        for (int i = 0; i < V; ++i)
++            vst1q_f32(out + t * N + 4 * i, sums[i]);
++    }
++}
++bool moe_tiled_dot(const uint8_t *p, const void *q, float *out, int rows, int nb, int nr, bool q6) {
++    assert((nr == 8 || nr == 16) && rows % nr == 0);
++    const auto *y = static_cast<const block_q8_K *>(q);
++    uint64_t fpcr;
++    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
++    if (fpcr != 0)
++        return false;
++    for (int bp = 0; bp < nb; ++bp) {
++        if (!std::isfinite(y[bp].d) || std::fabs(y[bp].d) > 1e20f)
++            return false;
++        for (int g = 0; g < 16; ++g)
++            if (y[bp].bsums[g] < -2048 || y[bp].bsums[g] > 2032)
++                return false;
++    }
++    const int sz = q6 ? 210 : 144;
++    for (int t = 0; t < rows / nr; ++t)
++        for (int bp = 0; bp < nb; ++bp) {
++            auto *b = p + (t * nb + bp) * nr * sz;
++            for (int r = 0; r < nr; ++r)
++                for (int k = 0; k < (q6 ? 1 : 2); ++k) {
++                    uint16_t h;
++                    std::memcpy(&h, b + (q6 ? 16 * nr + 2 * r : 4 * r) + 2 * k, 2);
++                    if ((h & 0x7c00) == 0x7c00)
++                        return false;
++                }
++        }
++    if (q6) {
++        if (nr == 16)
++            kernel<16, true>(p, y, out, rows, nb);
++        else
++            kernel<8, true>(p, y, out, rows, nb);
++    } else {
++        if (nr == 16)
++            kernel<16, false>(p, y, out, rows, nb);
++        else
++            kernel<8, false>(p, y, out, rows, nb);
++    }
++    return true;
++}
++
++#else
++bool moe_tiled_dot(const uint8_t *, const void *, float *, int, int, int, bool) { return false; }
++#endif
++
++#include "llama-moe-tiled.h"
++#include <cstring>
++#include <limits>
++
++static bool shape(int rows, int nb, int tile, bool q6, size_t capacity) {
++    const size_t size = q6 ? 210 : 144;
++    return rows > 0 && nb > 0 && (tile == 8 || tile == 16) && rows % tile == 0 &&
++           size_t(nb) <= capacity / size &&
++           size_t(rows) <= std::numeric_limits<size_t>::max() / size / size_t(nb) &&
++           nb <= std::numeric_limits<int>::max() / 256;
++}
++bool moe_tiled_unpack_row(const uint8_t *packed, void *raw, size_t capacity, int rows, int nb, int tile,
++                         bool q6, int row) {
++    if (!packed || !raw || !shape(rows, nb, tile, q6, capacity) || row < 0 || row >= rows)
++        return false;
++    const size_t size = q6 ? 210 : 144, header = q6 ? 18 : 16;
++    auto *out = static_cast<uint8_t *>(raw);
++    std::memset(out, 0, size_t(nb) * size);
++    const int lane = row % tile;
++    for (int bp = 0; bp < nb; ++bp) {
++        const auto *block = packed + (size_t(row / tile) * nb + bp) * tile * size;
++        auto *b = out + size_t(bp) * size;
++        if (q6) {
++            for (int c = 0; c < 16; ++c)
++                b[192 + c] = block[c * tile + lane];
++            std::memcpy(b + 208, block + 16 * tile + 2 * lane, 2);
++        } else {
++            std::memcpy(b, block + 4 * lane, 4);
++            for (int c = 4; c < 16; ++c)
++                b[c] = block[c * tile + lane];
++        }
++        for (int quad = 0; quad < 64; ++quad) {
++            const auto *p = block + header * tile + quad * (q6 ? 3 : 2) * tile;
++            for (int j = 0; j < 4; ++j) {
++                int f = 4 * lane + j, i = 4 * quad + j;
++                unsigned x = (p[f % (2 * tile)] >> (4 * (f / (2 * tile)))) & 15;
++                if (q6) {
++                    x |= ((p[2 * tile + f % tile] >> (2 * (f / tile))) & 3) << 4;
++                    int half = i / 128, local = i % 128;
++                    b[64 * half + local % 64] |= (x & 15) << (4 * (local / 64));
++                    b[128 + 32 * half + local % 32] |= (x >> 4) << (2 * (local / 32));
++                } else {
++                    b[16 + 32 * (i / 64) + i % 32] |= x << (4 * ((i % 64) / 32));
++                }
++            }
++        }
++    }
++    return true;
++}
++bool moe_tiled_reference_dot(const uint8_t *packed, const void *q8, float *out, int rows, int nb, int tile,
++                            bool q6, ggml_vec_dot_t dot, void *scratch, size_t capacity) {
++    if (!packed || !q8 || !out || !dot || !scratch || !shape(rows, nb, tile, q6, capacity))
++        return false;
++    for (int row = 0; row < rows; ++row) {
++        if (!moe_tiled_unpack_row(packed, scratch, capacity, rows, nb, tile, q6, row))
++            return false;
++        dot(nb * 256, out + row, 0, scratch, 0, q8, 0, 1);
++    }
++    return true;
++}
+--- /dev/null
++++ b/src/llama-moe-tiled.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include "ggml-cpu.h"
++#include <cstddef>
++#include <cstdint>
++void moe_tiled_pack(const uint8_t *, uint8_t *, int, int, int, bool);
++void moe_tiled_unpack(const uint8_t *, uint8_t *, int, int, int, bool);
++bool moe_tiled_dot(const uint8_t *, const void *, float *, int, int, int, bool);
++bool moe_tiled_unpack_row(const uint8_t *, void *, size_t, int, int, int, bool, int);
++bool moe_tiled_reference_dot(const uint8_t *, const void *, float *, int, int, int, bool, ggml_vec_dot_t, void *, size_t);

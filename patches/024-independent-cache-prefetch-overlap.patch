@@ -1,0 +1,29 @@
+--- a/src/llama-moe-paging.cpp
++++ b/src/llama-moe-paging.cpp
+@@ -2788,7 +2788,11 @@
+ }
+ 
+ void stage_event(llama_moe_paging_layer & l, const int32_t * req, int k, int32_t * out_slot) {
+-    if (g.prefetch_enabled) {
++    // Demand-only frequency_age and resident overlap share the authoritative
++    // demand engine. With P=0 there are no nominations, probation slots or reads.
++    if (g.prefetch_enabled || (llama_moe_paging_direct_storage() &&
++            g.backend == "gguf3" && !g.hot && !l.oracle_plan_valid &&
++            (g.overlap_enabled || g.policy == "frequency_age"))) {
+         stage_event_prefetch(l, req, k, out_slot);
+         return;
+     }
+@@ -3357,8 +3361,11 @@
+         }
+     }
+ 
+-    if (g.policy == "frequency_age" && (!g.prefetch_enabled || g.prefetch_mode != "a0")) {
+-        GGML_ABORT("frequency_age requires direct_sparse/gguf3/A0/P>0/QD>1/hot=0");
++    if (g.policy == "frequency_age" && !(g.compute_mode == "direct_sparse" &&
++            g.backend == "gguf3" && !g.hot && g.qd > 1 &&
++            ((g.prefetch_enabled && g.prefetch_mode == "a0") ||
++             (!g.prefetch_enabled && g.prefetch_mode == "off" && g.prefetch_p == 0)))) {
++        GGML_ABORT("frequency_age requires direct_sparse/gguf3/QD>1/hot=0 and A0/P>0 or off/P0");
+     }
+ 
+     g.pf_admission = getenv_str("LLAMA_MOE_PAGING_PREFETCH_ADMISSION", "all");

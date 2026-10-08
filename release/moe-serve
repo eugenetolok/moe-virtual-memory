@@ -1,0 +1,462 @@
+#!/bin/bash
+#
+# moe-serve - one-command launcher for the MoE virtual-expert-memory paged runtime.
+#
+# This runs the exact Execution-004 algorithm (fixed K=8 staging, gguf3 direct-GGUF
+# reads, bounded QD worker pool, LRU). It does NOT require an environment file or a
+# source tree: the only external input is the exact Qwen GGUF named by the manifest.
+#
+# Defaults (larger machines): M=8, QD=4, ctx 512, -ngl 99, -b 512, -ub 1, warmup on,
+# serve profile = normal OS caching, localhost, no tracing, no timing marker, no asserts.
+#
+# Small unified memory (<= ~9.6 GiB): unless the corresponding flag is given, the launcher
+# uses the Execution-007 physically validated defaults: -ngl 0 (CPU-only), M=16, QD=4,
+# ctx 1024, -b 16, -ub 1, warmup off, and cache=nocache (best-effort F_NOCACHE, the
+# configuration actually measured on the M1 8 GB). Explicit flags always win.
+# Placement measured (execution 006): ngl1/2 run but are slower, ngl4 starts swapping,
+# ngl8 swap-thrashes, ngl99 OOMs.
+#
+# Usage:
+#   ./bin/moe-serve --model /path/to/qwen.gguf [options]
+#
+# Options:
+#   --model PATH          exact GGUF (required)
+#   --profile serve|bringup
+#                         serve    = normal OS caching, no diagnostics
+#                         bringup  = best-effort F_NOCACHE + stats
+#   --M N                 resident slots per layer (default 8; 16 on <=9.6 GiB)
+#   --qd N                I/O worker depth 1..16 (default 4)
+#   --ctx N               context length (default 512; 1024 on <=9.6 GiB)
+#   --gpu-layers N        layers on GPU / -ngl (default 99; 0 on <=9.6 GiB)
+#   --batch N             logical batch / -b (default 512; 16 on <=9.6 GiB; must be >= 2)
+#   --ubatch N            physical batch / -ub (default 1)
+#   --warmup on|off       warmup run (default on; off on <=9.6 GiB; off adds --no-warmup)
+#   --flash-attn on|off|auto   Flash Attention (default: server default)
+#   --assert on|off       paging debug assertions (default off; diagnostics only)
+#   --stage-mode MODE     K8 staging mode serial|overlap|persistent_overlap (default serial)
+#   --compute-mode MODE   expert compute mode staging|direct_sparse (default staging)
+#   --expert-sidecar PATH verified offline tile16 experts (requires direct_sparse; original --model still required)
+#   --prefetch-admission MODE  all (default) | rank_gate | time_gate (experimental, A0/P2)
+#   --prefetch-decisions PATH  causal nomination/admission CSV
+#   --telemetry MODE  off (default) | summary | trace
+#   --trace-output PATH --trace-first N --trace-count N --trace-stride N --trace-budget-mib N
+#   --cache-policy MODE  lru (default) | frequency_age (A0/P>0 or off/P0)
+#   --overlap on|off      exact resident compute while cold reads run (default off)
+#   --overlap-threads N   bounded resident CPU lanes 1..8 (default 4)
+#   --overlap-events PATH event-level measurement CSV
+#   --prefetch-sequence PATH full speculative submission sequence
+#   --route-trace PATH    ordered authoritative routes
+#   --timing on|off       CPU timing marker (default off; perturbs scheduling)
+#   --load-mode MODE      llama.cpp -lm load mode (default: unset)
+#   --port N              localhost port (default 8080)
+#   --cache default|nocache   (serve default; nocache on <=9.6 GiB and for bringup)
+#   --stats PATH          paging stats JSON path
+#   --listen ADDR         bind address (default 127.0.0.1)
+#   --validate-model      verify the model against the manifest, then exit
+#   --force-hash          ignore the SHA-256 cache and re-hash the model
+#   --print-config        print the resolved configuration, then exit
+#   --dry-run             print the llama-server command, then exit
+#   -- EXTRA...           extra arguments passed through to llama-server
+#
+# Environment (deterministic testing): MOE_SERVE_MEM_BYTES overrides the detected
+# hw.memsize for the small-memory branch; it does not change the normal runtime path.
+#
+set -u
+
+SELF="$0"
+while [ -h "$SELF" ]; do
+  SELF_DIR=$(cd "$(dirname "$SELF")" && pwd)
+  LINK=$(ls -ld "$SELF" | sed -e 's/.*-> //')
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$SELF_DIR/$LINK" ;;
+  esac
+done
+BIN_DIR=$(cd "$(dirname "$SELF")" && pwd)
+PKG_DIR=$(cd "$BIN_DIR/.." && pwd)
+LLAMA_SERVER="$BIN_DIR/llama-server"
+MANIFEST="$PKG_DIR/share/model-manifest.json"
+OFFSETS="$PKG_DIR/share/gguf_expert_offsets.csv"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/moe-virtual-memory"
+CACHE_FILE="$CACHE_DIR/model-identity.json"
+
+die() { echo "moe-serve: ERROR: $*" >&2; exit 1; }
+info() { echo "moe-serve: $*" >&2; }
+
+usage() {
+  sed -n '2,/^set -u/p' "$0" | sed -e 's/^# \{0,1\}//' | sed '$d'
+}
+
+manifest_field() {
+  sed -n 's/.*"'"$1"'":[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' "$MANIFEST" | head -1
+}
+
+# ---- defaults -------------------------------------------------------------
+MODEL=""
+EXPERT_SIDECAR=""
+PROFILE="serve"
+M=8
+M_SET=0
+QD=4
+QD_SET=0
+CTX=512
+CTX_SET=0
+NGL=99
+NGL_SET=0
+BATCH=512
+BATCH_SET=0
+UBATCH=1
+UBATCH_SET=0
+WARMUP="on"
+WARMUP_SET=0
+FLASH_ATTN=""
+ASSERT=0
+TIMING=0
+LOAD_MODE=""
+PORT=8080
+NOCACHE=""
+NOCACHE_SET=0
+STATS=""
+LISTEN="127.0.0.1"
+VALIDATE_ONLY=0
+FORCE_HASH=0
+PRINT_CONFIG=0
+DRY_RUN=0
+EXTRA=""
+STAGE_MODE="serial"
+COMPUTE_MODE="staging"
+HOT=0
+PREFETCH_P=0
+PREFETCH_MODE="off"
+# Execution 017: normal A0 default is the shared speculative batch.
+PREFETCH_SHARED=1
+CACHE_POLICY=lru
+PREFETCH_ADMISSION=all; PREFETCH_DECISIONS=""
+TELEMETRY=off; TRACE_OUTPUT=""; TRACE_FIRST=46; TRACE_COUNT=4; TRACE_STRIDE=1; TRACE_BUDGET=4
+OVERLAP=0; OVERLAP_THREADS=4; OVERLAP_EVENTS=""; PREFETCH_SEQUENCE=""; ROUTE_TRACE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --expert-sidecar) EXPERT_SIDECAR="$2"; shift 2 ;;
+    --expert-sidecar=*) EXPERT_SIDECAR="${1#*=}"; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --model=*) MODEL="${1#*=}"; shift ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --profile=*) PROFILE="${1#*=}"; shift ;;
+    --M|--m) M="$2"; M_SET=1; shift 2 ;;
+    --M=*|--m=*) M="${1#*=}"; M_SET=1; shift ;;
+    --qd) QD="$2"; QD_SET=1; shift 2 ;;
+    --qd=*) QD="${1#*=}"; QD_SET=1; shift ;;
+    --ctx) CTX="$2"; CTX_SET=1; shift 2 ;;
+    --ctx=*) CTX="${1#*=}"; CTX_SET=1; shift ;;
+    --gpu-layers|--ngl) NGL="$2"; NGL_SET=1; shift 2 ;;
+    --gpu-layers=*|--ngl=*) NGL="${1#*=}"; NGL_SET=1; shift ;;
+    --batch) BATCH="$2"; BATCH_SET=1; shift 2 ;;
+    --batch=*) BATCH="${1#*=}"; BATCH_SET=1; shift ;;
+    --ubatch) UBATCH="$2"; UBATCH_SET=1; shift 2 ;;
+    --ubatch=*) UBATCH="${1#*=}"; UBATCH_SET=1; shift ;;
+    --warmup) WARMUP="$2"; WARMUP_SET=1; shift 2 ;;
+    --warmup=*) WARMUP="${1#*=}"; WARMUP_SET=1; shift ;;
+    --flash-attn) FLASH_ATTN="$2"; shift 2 ;;
+    --flash-attn=*) FLASH_ATTN="${1#*=}"; shift ;;
+    --assert) ASSERT_ON="$2"; shift 2 ;;
+    --assert=*) ASSERT_ON="${1#*=}"; shift ;;
+    --stage-mode) STAGE_MODE="$2"; shift 2 ;;
+    --stage-mode=*) STAGE_MODE="${1#*=}"; shift ;;
+    --compute-mode) COMPUTE_MODE="$2"; shift 2 ;;
+    --compute-mode=*) COMPUTE_MODE="${1#*=}"; shift ;;
+    --hot) HOT=1; shift ;;
+    --hot=*) HOT="${1#*=}"; shift ;;
+    --prefetch-p) PREFETCH_P="$2"; shift 2 ;;
+    --prefetch-p=*) PREFETCH_P="${1#*=}"; shift ;;
+    --prefetch-mode) PREFETCH_MODE="$2"; shift 2 ;;
+    --prefetch-mode=*) PREFETCH_MODE="${1#*=}"; shift ;;
+    --prefetch-shared) PREFETCH_SHARED="$2"; shift 2 ;;
+    --prefetch-shared=*) PREFETCH_SHARED="${1#*=}"; shift ;;
+    --prefetch-admission) PREFETCH_ADMISSION="$2"; shift 2 ;;
+    --prefetch-decisions) PREFETCH_DECISIONS="$2"; shift 2 ;;
+    --telemetry) TELEMETRY="$2"; shift 2 ;;
+    --trace-output) TRACE_OUTPUT="$2"; shift 2 ;;
+    --trace-first) TRACE_FIRST="$2"; shift 2 ;;
+    --trace-count) TRACE_COUNT="$2"; shift 2 ;;
+    --trace-stride) TRACE_STRIDE="$2"; shift 2 ;;
+    --trace-budget-mib) TRACE_BUDGET="$2"; shift 2 ;;
+    --cache-policy) CACHE_POLICY="$2"; shift 2 ;;
+    --overlap) OVERLAP="$2"; shift 2 ;;
+    --overlap-threads) OVERLAP_THREADS="$2"; shift 2 ;;
+    --overlap-events) OVERLAP_EVENTS="$2"; shift 2 ;;
+    --prefetch-sequence) PREFETCH_SEQUENCE="$2"; shift 2 ;;
+    --route-trace) ROUTE_TRACE="$2"; shift 2 ;;
+    --timing) TIMING_ON="$2"; shift 2 ;;
+    --timing=*) TIMING_ON="${1#*=}"; shift ;;
+    --load-mode) LOAD_MODE="$2"; shift 2 ;;
+    --load-mode=*) LOAD_MODE="${1#*=}"; shift ;;
+    --port) PORT="$2"; shift 2 ;;
+    --port=*) PORT="${1#*=}"; shift ;;
+    --cache) NOCACHE="$2"; NOCACHE_SET=1; shift 2 ;;
+    --cache=*) NOCACHE="${1#*=}"; NOCACHE_SET=1; shift ;;
+    --stats) STATS="$2"; shift 2 ;;
+    --stats=*) STATS="${1#*=}"; shift ;;
+    --listen) LISTEN="$2"; shift 2 ;;
+    --listen=*) LISTEN="${1#*=}"; shift ;;
+    --validate-model) VALIDATE_ONLY=1; shift ;;
+    --force-hash) FORCE_HASH=1; shift ;;
+    --print-config) PRINT_CONFIG=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; EXTRA="$*"; break ;;
+    *) die "unknown argument '$1' (try --help)" ;;
+  esac
+done
+
+[ -n "$MODEL" ] || { usage; die "--model is required"; }
+[ -x "$LLAMA_SERVER" ] || die "missing packaged binary: $LLAMA_SERVER"
+[ -f "$MANIFEST" ] || die "missing manifest: $MANIFEST"
+[ -f "$OFFSETS" ] || die "missing offset table: $OFFSETS"
+
+# ---- physical-memory detection and Execution-007 low-memory defaults ------
+# MOE_SERVE_MEM_BYTES is a deterministic test hook (bytes). The normal path reads
+# hw.memsize; the hook only substitutes that one input.
+MEM_BYTES=0
+if [ -n "${MOE_SERVE_MEM_BYTES:-}" ]; then
+  case "$MOE_SERVE_MEM_BYTES" in ''|*[!0-9]*) die "MOE_SERVE_MEM_BYTES must be an integer" ;; esac
+  MEM_BYTES="$MOE_SERVE_MEM_BYTES"
+elif command -v sysctl >/dev/null 2>&1; then
+  MEM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+fi
+LOW_MEM=0
+if [ "$MEM_BYTES" -gt 0 ] && [ "$MEM_BYTES" -le 10307921510 ]; then LOW_MEM=1; fi
+
+# Fill only the parameters the user did not explicitly set; explicit flags always win.
+if [ "$LOW_MEM" -eq 1 ]; then
+  [ "$NGL_SET" -eq 0 ] && NGL=0
+  [ "$M_SET" -eq 0 ] && M=16
+  [ "$QD_SET" -eq 0 ] && QD=4
+  [ "$CTX_SET" -eq 0 ] && CTX=1024
+  [ "$BATCH_SET" -eq 0 ] && BATCH=16
+  [ "$UBATCH_SET" -eq 0 ] && UBATCH=1
+  [ "$WARMUP_SET" -eq 0 ] && WARMUP="off"
+  [ "$NOCACHE_SET" -eq 0 ] && NOCACHE="nocache"
+  info "small unified memory ($((MEM_BYTES / 1073741824)) GiB): Execution-007 defaults ngl=0 M=16 QD=4 ctx=1024 batch=16 ubatch=1 warmup=off cache=nocache (explicit flags win)"
+fi
+
+case "$PROFILE" in
+  serve)   [ -n "$NOCACHE" ] || NOCACHE="default" ;;
+  bringup) [ -n "$NOCACHE" ] || NOCACHE="nocache" ;;
+  *) die "--profile must be serve or bringup" ;;
+esac
+case "$NOCACHE" in
+  default) NOCACHE=0 ;;
+  nocache) NOCACHE=1 ;;
+  0|1) : ;;
+  *) die "--cache must be default or nocache" ;;
+esac
+case "$STAGE_MODE" in
+  serial|overlap|persistent_overlap) : ;;
+  *) die "--stage-mode must be serial, overlap, or persistent_overlap" ;;
+esac
+case "$COMPUTE_MODE" in
+  staging|direct_sparse) : ;;
+  *) die "--compute-mode must be staging or direct_sparse" ;;
+esac
+case "$HOT" in 0|1) : ;; *) die "--hot must be 0 or 1" ;; esac
+case "$PREFETCH_P" in ''|*[!0-9]*) die "--prefetch-p must be a non-negative integer" ;; esac
+case "$PREFETCH_MODE" in off|a0|a0_shadow|oracle) : ;; *) die "--prefetch-mode must be off, a0, a0_shadow, or oracle" ;; esac
+if [ "$PREFETCH_P" -gt 0 ] && [ "$PREFETCH_MODE" = "off" ]; then die "--prefetch-p requires --prefetch-mode"; fi
+case "$PREFETCH_SHARED" in
+  shared|on|1) PREFETCH_SHARED=1 ;;
+  split|off|0) PREFETCH_SHARED=0 ;;
+  *) die "--prefetch-shared must be shared/split/on/off/1/0" ;;
+esac
+case "$TELEMETRY" in off|summary|trace) : ;; *) die "--telemetry must be off, summary or trace" ;; esac
+for value in "$TRACE_FIRST" "$TRACE_COUNT" "$TRACE_STRIDE" "$TRACE_BUDGET"; do
+  case "$value" in ''|*[!0-9]*) die "trace settings must be unsigned integers" ;; esac
+done
+[ "$TRACE_COUNT" -gt 0 ] && [ "$TRACE_STRIDE" -gt 0 ] && [ "$TRACE_BUDGET" -ge 1 ] && [ "$TRACE_BUDGET" -le 32 ] || die "invalid bounded trace settings"
+[ "$TELEMETRY" != trace ] || [ -n "$TRACE_OUTPUT" ] || die "trace requires --trace-output"
+if [ "$TELEMETRY" != off ] && { [ "$COMPUTE_MODE" != direct_sparse ] || [ "$QD" -le 1 ] || [ "$NGL" != 0 ]; }; then die "telemetry requires CPU direct_sparse QD>1"; fi
+case "$PREFETCH_ADMISSION" in all|rank_gate|time_gate) : ;; *) die "--prefetch-admission must be all, rank_gate or time_gate" ;; esac
+if [ "$PREFETCH_ADMISSION" != all ] && { [ "$PREFETCH_MODE" != a0 ] || [ "$PREFETCH_P" != 2 ]; }; then
+  die "rank_gate/time_gate requires a0/P2 (K16)"
+fi
+case "$CACHE_POLICY" in lru|frequency_age) : ;; *) die "--cache-policy must be lru or frequency_age" ;; esac
+if [ "$CACHE_POLICY" = frequency_age ] && { [ "$COMPUTE_MODE" != direct_sparse ] || [ "$QD" -le 1 ] || [ "$NGL" != 0 ] || [ "$HOT" != 0 ] || ! { { [ "$PREFETCH_MODE" = a0 ] && [ "$PREFETCH_P" -gt 0 ]; } || { [ "$PREFETCH_MODE" = off ] && [ "$PREFETCH_P" -eq 0 ]; }; }; }; then
+  die "frequency_age requires direct_sparse, QD>1, gpu-layers=0, hot=0 and a0/P>0 or off/P0"
+fi
+case "$OVERLAP" in on|1) OVERLAP=1 ;; off|0) OVERLAP=0 ;; *) die "--overlap must be on or off" ;; esac
+case "$OVERLAP_THREADS" in 1|2|3|4|5|6|7|8) : ;; *) die "--overlap-threads must be 1..8" ;; esac
+if [ "$OVERLAP" = 1 ] && { [ "$COMPUTE_MODE" != direct_sparse ] || [ "$UBATCH" != 1 ] || [ "$NGL" != 0 ] || [ "$HOT" != 0 ] || ! { { [ "$PREFETCH_MODE" = a0 ] && [ "$PREFETCH_P" -gt 0 ]; } || { [ "$PREFETCH_MODE" = off ] && [ "$PREFETCH_P" -eq 0 ]; }; }; }; then
+  die "--overlap on requires direct_sparse, ubatch=1, gpu-layers=0, hot=0 and a0/P>0 or off/P0"
+fi
+case "$M" in ''|*[!0-9]*) die "--M must be an integer" ;; esac
+case "$QD" in ''|*[!0-9]*) die "--qd must be an integer" ;; esac
+if [ "$QD" -lt 1 ] || [ "$QD" -gt 16 ]; then die "--qd must be in 1..16"; fi
+case "$NGL" in ''|*[!0-9]*) die "--gpu-layers must be a non-negative integer" ;; esac
+case "$BATCH" in ''|*[!0-9]*) die "--batch must be an integer" ;; esac
+case "$UBATCH" in ''|*[!0-9]*) die "--ubatch must be an integer" ;; esac
+if [ "$BATCH" -lt 2 ]; then die "--batch must be >= 2 (batch=1 aborts this llama.cpp server probe)"; fi
+if [ "$UBATCH" -lt 1 ]; then die "--ubatch must be >= 1"; fi
+if [ "$UBATCH" -gt "$BATCH" ]; then die "--ubatch must be <= --batch"; fi
+case "$WARMUP" in on|off) : ;; *) die "--warmup must be on or off" ;; esac
+case "$FLASH_ATTN" in ""|on|off|auto) : ;; *) die "--flash-attn must be on, off, or auto" ;; esac
+case "${ASSERT_ON:-}" in ""|off) ASSERT=0 ;; on) ASSERT=1 ;; *) die "--assert must be on or off" ;; esac
+case "${TIMING_ON:-}" in ""|off) TIMING=0 ;; on) TIMING=1 ;; *) die "--timing must be on or off" ;; esac
+[ -n "$STATS" ] || STATS="${TMPDIR:-/tmp}/moe-paging-stats-${PORT}.json"
+
+# A user who explicitly forces Metal offload on a small machine gets the measured note.
+if [ "$LOW_MEM" -eq 1 ] && [ "$NGL" -gt 0 ]; then
+  info "measured M1 8 GB placement: ngl1/2 run but are slower than ngl0; ngl4 starts swapping; ngl8 swap-thrashes; ngl99 OOMs."
+fi
+
+verify_offsets() {
+  local want got
+  want=$(manifest_field offsets_sha256)
+  got=$(shasum -a 256 "$OFFSETS" | awk '{print $1}')
+  [ -n "$want" ] || die "manifest has no offsets_sha256"
+  [ "$want" = "$got" ] || die "offset table checksum mismatch: want $want got $got"
+}
+
+verify_model() {
+  local size mtime want_sha got_sha c_path c_size c_mtime c_sha
+  [ -f "$MODEL" ] || die "model not found: $MODEL"
+  size=$(stat -L -f '%z' "$MODEL")
+  want_sha=$(manifest_field gguf_sha256)
+  [ -n "$want_sha" ] || die "manifest has no gguf_sha256"
+  [ "$size" = "$(manifest_field gguf_size_bytes)" ] || \
+    die "model size mismatch: file=$size manifest=$(manifest_field gguf_size_bytes)"
+
+  if [ "$FORCE_HASH" -eq 0 ] && [ -f "$CACHE_FILE" ]; then
+    c_path=$(sed -n 's/.*"path":[[:space:]]*"\([^"]*\)".*/\1/p' "$CACHE_FILE" | head -1)
+    c_size=$(sed -n 's/.*"size":[[:space:]]*\([0-9]*\).*/\1/p' "$CACHE_FILE" | head -1)
+    c_mtime=$(sed -n 's/.*"mtime":[[:space:]]*\([0-9]*\).*/\1/p' "$CACHE_FILE" | head -1)
+    c_sha=$(sed -n 's/.*"sha256":[[:space:]]*"\([^"]*\)".*/\1/p' "$CACHE_FILE" | head -1)
+    mtime=$(stat -L -f '%m' "$MODEL")
+    if [ "$c_path" = "$MODEL" ] && [ "$c_size" = "$size" ] && [ "$c_mtime" = "$mtime" ] && [ "$c_sha" = "$want_sha" ]; then
+      info "model identity verified from cache (path/size/mtime/sha256)"
+      return 0
+    fi
+  fi
+
+  info "hashing model once ($((size / 1048576)) MiB) - this can take a minute..."
+  got_sha=$(shasum -a 256 "$MODEL" | awk '{print $1}')
+  [ "$got_sha" = "$want_sha" ] || die "model SHA-256 mismatch: want $want_sha got $got_sha"
+  mtime=$(stat -L -f '%m' "$MODEL")
+  if mkdir -p "$CACHE_DIR" 2>/dev/null && \
+     printf '{"path":"%s","size":%s,"mtime":%s,"sha256":"%s"}\n' \
+       "$MODEL" "$size" "$mtime" "$got_sha" > "$CACHE_FILE" 2>/dev/null; then
+    info "model SHA-256 verified; cached identity at $CACHE_FILE"
+  else
+    info "WARNING: could not write hash cache under $CACHE_DIR; model verified for this run only"
+  fi
+}
+
+verify_offsets
+verify_model
+if [ -n "$EXPERT_SIDECAR" ]; then
+  [ -f "$EXPERT_SIDECAR" ] || die "expert sidecar not found: $EXPERT_SIDECAR"
+  [ "$COMPUTE_MODE" = direct_sparse ] || die "--expert-sidecar requires --compute-mode direct_sparse"
+  [ "$HOT" = 0 ] || die "tile16 sidecar does not support --hot"
+fi
+if [ "$VALIDATE_ONLY" -eq 1 ]; then info "model and offset table are valid"; exit 0; fi
+
+case "$LISTEN" in
+  127.0.0.1|localhost|::1) : ;;
+  *) info "WARNING: binding to non-local address $LISTEN" ;;
+esac
+
+# ---- Execution-004 paging environment -------------------------------------
+export LLAMA_MOE_PAGING_M="$M"
+export LLAMA_MOE_PAGING_POLICY="$CACHE_POLICY"
+export MOE_TELEMETRY="$TELEMETRY" MOE_TRACE_OUTPUT="$TRACE_OUTPUT" MOE_TRACE_FIRST="$TRACE_FIRST" MOE_TRACE_COUNT="$TRACE_COUNT" MOE_TRACE_STRIDE="$TRACE_STRIDE" MOE_TRACE_BUDGET_MIB="$TRACE_BUDGET"
+export LLAMA_MOE_PAGING_PREFETCH_ADMISSION="$PREFETCH_ADMISSION"
+export LLAMA_MOE_PAGING_PREFETCH_DECISIONS="$PREFETCH_DECISIONS"
+export LLAMA_MOE_PAGING_BACKEND="gguf3"
+export LLAMA_MOE_PAGING_QD="$QD"
+export LLAMA_MOE_PAGING_HOT="$HOT"
+export LLAMA_MOE_PAGING_ASSERT="$ASSERT"
+export LLAMA_MOE_PAGING_STAGE_MODE="$STAGE_MODE"
+export LLAMA_MOE_PAGING_COMPUTE_MODE="$COMPUTE_MODE"
+export LLAMA_MOE_PAGING_TIMING="$TIMING"
+export LLAMA_MOE_PAGING_NOCACHE="$NOCACHE"
+export LLAMA_MOE_PAGING_STATS="$STATS"
+export LLAMA_MOE_PAGING_STATS_INTERVAL="128"
+export LLAMA_MOE_PAGING_GGUF="$MODEL"
+export LLAMA_MOE_PAGING_LAYOUT=raw
+if [ -n "$EXPERT_SIDECAR" ]; then
+  export LLAMA_MOE_PAGING_GGUF="$EXPERT_SIDECAR"
+  export LLAMA_MOE_PAGING_LAYOUT=tile16
+fi
+export LLAMA_MOE_PAGING_OFFSETS="$OFFSETS"
+export LLAMA_MOE_PAGING_STORE="$PKG_DIR/share/.no-packed-store-required-for-gguf3"
+export LLAMA_MOE_PAGING_PREFETCH_P="$PREFETCH_P"
+export LLAMA_MOE_PAGING_PREFETCH_MODE="$PREFETCH_MODE"
+export LLAMA_MOE_PAGING_PREFETCH_SHARED="$PREFETCH_SHARED"
+export LLAMA_MOE_PAGING_OVERLAP="$OVERLAP"
+export LLAMA_MOE_PAGING_OVERLAP_THREADS="$OVERLAP_THREADS"
+export LLAMA_MOE_PAGING_OVERLAP_VERIFY=0
+export LLAMA_MOE_PAGING_OVERLAP_EVENTS="$OVERLAP_EVENTS"
+export LLAMA_MOE_PAGING_PREFETCH_SEQ="$PREFETCH_SEQUENCE"
+
+if [ "$PRINT_CONFIG" -eq 1 ]; then
+  cat <<EOF
+model        = $MODEL
+expert source = ${EXPERT_SIDECAR:-$MODEL}
+expert layout = $LLAMA_MOE_PAGING_LAYOUT
+profile      = $PROFILE
+M            = $M
+QD           = $QD
+ctx          = $CTX
+gpu_layers   = $NGL
+batch        = $BATCH
+ubatch       = $UBATCH
+warmup       = $WARMUP
+flash_attn   = ${FLASH_ATTN:-unset}
+load_mode    = ${LOAD_MODE:-unset}
+port         = $PORT
+listen       = $LISTEN
+memory_bytes = $MEM_BYTES
+low_memory   = $LOW_MEM
+explicit     = ngl=$NGL_SET M=$M_SET QD=$QD_SET ctx=$CTX_SET batch=$BATCH_SET ubatch=$UBATCH_SET warmup=$WARMUP_SET cache=$NOCACHE_SET
+nocache      = $NOCACHE
+stats        = $STATS
+backend      = gguf3
+policy       = $CACHE_POLICY
+prefetch_admission = $PREFETCH_ADMISSION
+telemetry = $TELEMETRY (first=$TRACE_FIRST count=$TRACE_COUNT stride=$TRACE_STRIDE budget_mib=$TRACE_BUDGET output=$TRACE_OUTPUT)
+timing       = $TIMING
+assertions   = $ASSERT
+stage_mode   = $STAGE_MODE
+compute_mode = $COMPUTE_MODE
+prefetch_p   = $PREFETCH_P
+prefetch_mode = $PREFETCH_MODE
+prefetch_shared = $PREFETCH_SHARED
+overlap = $OVERLAP
+overlap_threads = $OVERLAP_THREADS
+offsets      = $OFFSETS
+manifest     = $MANIFEST
+EOF
+  exit 0
+fi
+
+set -- "$LLAMA_SERVER" -m "$MODEL" -ngl "$NGL" -b "$BATCH" -ub "$UBATCH" -c "$CTX" -np 1 \
+       --host "$LISTEN" --port "$PORT" --no-webui -cmoe
+[ "$WARMUP" = "off" ] && set -- "$@" --no-warmup
+[ -n "$FLASH_ATTN" ] && set -- "$@" -fa "$FLASH_ATTN"
+[ -n "$LOAD_MODE" ] && set -- "$@" -lm "$LOAD_MODE"
+[ -n "$ROUTE_TRACE" ] && set -- "$@" --moe-trace "$ROUTE_TRACE"
+if [ -n "$EXTRA" ]; then
+  set -- "$@" $EXTRA
+fi
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "env LLAMA_MOE_PAGING_LAYOUT=$LLAMA_MOE_PAGING_LAYOUT"
+  printf 'env LLAMA_MOE_PAGING_GGUF=%q\n' "$LLAMA_MOE_PAGING_GGUF"
+  echo "env LLAMA_MOE_PAGING_OVERLAP=$OVERLAP"
+  echo "env LLAMA_MOE_PAGING_OVERLAP_THREADS=$OVERLAP_THREADS"
+  echo "env LLAMA_MOE_PAGING_PREFETCH_P=$PREFETCH_P"
+  echo "env LLAMA_MOE_PAGING_PREFETCH_MODE=$PREFETCH_MODE"
+  echo "env LLAMA_MOE_PAGING_PREFETCH_SHARED=$PREFETCH_SHARED"
+  printf '%s ' "$@"; echo
+  exit 0
+fi
+info "starting M=$M QD=$QD ctx=$CTX ngl=$NGL batch=$BATCH ubatch=$UBATCH warmup=$WARMUP port=$PORT profile=$PROFILE (gguf3, LRU)"
+exec "$@"

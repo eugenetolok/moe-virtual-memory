@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "artifact": "moe-virtual-memory-macos-arm64-rc1",
+  "model_name": "Qwen3.6-35B-A3B",
+  "arch": "qwen35moe",
+  "gguf_size_bytes": 23938321664,
+  "gguf_sha256": "f5ee307a2982106a6eb82b62b2c00b575c9072145a759ae4660378acda8dcf2d",
+  "n_layer": 40,
+  "n_expert": 256,
+  "n_expert_used": 8,
+  "n_embd": 2048,
+  "n_ff_exp": 512,
+  "record_stride": 2039808,
+  "gate_bytes": 589824,
+  "up_bytes": 589824,
+  "down_bytes": 860160,
+  "offsets_file": "share/gguf_expert_offsets.csv",
+  "offsets_sha256": "d0634f26c62a91a1d6157f117cd10e8c59f62c2ce39e3bcf221f5b1f27ef90d9",
+  "offsets_rows": 40,
+  "notes": "Exact tested model. The launcher refuses to start the gguf3 paging backend unless the file size, SHA-256, and offset-table checksum match this manifest. Direct-GGUF offsets are model-specific."
+}

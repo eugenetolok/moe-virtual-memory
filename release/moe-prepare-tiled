@@ -1,0 +1,29 @@
+#!/bin/bash
+# Build the exact supported tile16 sidecar offline, without loading a model into RAM.
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"; PKG_DIR="$(cd "$BIN_DIR/.." && pwd)"
+MODEL=""; OUTPUT=""
+while [ $# -gt 0 ]; do
+ case "$1" in
+  --model) MODEL="$2"; shift 2 ;;
+  --output) OUTPUT="$2"; shift 2 ;;
+  -h|--help) echo 'Usage: moe-prepare-tiled --model original.gguf --output experts.tile16'; exit 0 ;;
+  *) echo "unknown argument: $1" >&2; exit 2 ;;
+ esac
+done
+[ -f "$MODEL" ] && [ -n "$OUTPUT" ] || { echo 'model and output required' >&2; exit 2; }
+COMPILER="$BIN_DIR/moe-tile16-compiler"
+MODEL_SHA=f5ee307a2982106a6eb82b62b2c00b575c9072145a759ae4660378acda8dcf2d
+SIDECAR_SHA=e3dfd7ff1c930f665bdd45f45615d40eeaef40cede7f4eb8dfda1808dcf2d245
+PLAN_SHA=94a2457240a0d49542627330e643fb159e9f672c1686c24e4a41c83c646faf89
+PLAN="$PKG_DIR/share/tile16-plan.txt"
+[ "$(shasum -a 256 "$PLAN" | awk '{print $1}')" = "$PLAN_SHA" ] || { echo 'plan SHA mismatch' >&2; exit 1; }
+[ "$("$COMPILER" --hash "$MODEL")" = "$MODEL_SHA" ] || { echo 'original model SHA mismatch' >&2; exit 1; }
+if [ ! -e "$OUTPUT" ]; then
+ [ ! -e "$OUTPUT.index.json" ] || { echo "index output already exists: $OUTPUT.index.json" >&2; exit 1; }
+ "$COMPILER" "$MODEL" "$PLAN" "$OUTPUT" "$OUTPUT.index.json" "$MODEL_SHA"
+fi
+[ "$("$COMPILER" --hash "$OUTPUT")" = "$SIDECAR_SHA" ] || { echo 'sidecar SHA mismatch' >&2; exit 1; }
+chmod a-w "$OUTPUT"
+echo "Verified tile16 sidecar: $OUTPUT"
+echo 'Additional disk payload is20.9 GB; online expert read lengths remain unchanged.'
