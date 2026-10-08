@@ -4,7 +4,9 @@
 
 This public repository contains the author-maintained **patch sources**, launchers, benchmark drivers and evidence. The source checkout used to compile historical rc14 was an **ignored local `llama.cpp` tree**, not committed in the private Git project.
 
-For a trustworthy third-party native build, we must pin the exact compatible upstream commit, reproduce the complete cumulative patch state, and validate independent exactness. Without that upstream SHA/source-tree evidence a green workflow cannot be claimed to reproduce the historical 7.185 TPS artifact.
+The upstream base and the cumulative rc14 patch have since been recovered and independently verified: see [`source/`](../source/README.md). `source/upstream.sha` pins upstream commit `81bc6b83f827df746eb129235488d325c49cae52`, and `source/patch-series.txt` applies the audited cumulative patch that reproduces all 21 changed files byte-for-byte.
+
+Recovering the source tree does **not** by itself qualify a binary. A green workflow still cannot claim to reproduce the historical 7.185 TPS artifact until the rebuilt source passes independent exactness and a physical M1 run, recorded in `source/RELEASE_APPROVED.json`.
 
 For that reason, automated workflows distinguish **source checks** from **native release qualification**. Missing `source/upstream.sha` is an explicit release blocker, not a hidden fallback to the latest upstream.
 

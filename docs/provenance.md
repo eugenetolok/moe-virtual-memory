@@ -7,9 +7,9 @@ This is a **curated export** from the author's private research repository, not 
 - `patches/`: human-readable C/C++ changes to `llama.cpp` and `ggml`. Some early patches are **cumulative snapshots**, not a blindly sequential `git apply` series.
 - `release/`: model-specific launchers, manifest and experiment drivers. Some legacy scripts reference package-native binaries not present in the source export; do not claim their end-to-end function before compiling those binaries.
 - `simulator/`: selected test/benchmark source for experimental tools.
-- `source/`: exact-source lock and reviewed patch order *to be filled only after passing the source-provenance audit*.
+- `source/`: exact-source lock and reviewed patch order. It pins upstream `llama.cpp` commit `81bc6b83f827df746eb129235488d325c49cae52` and a single verified cumulative patch; per-file SHA-256 values are in `source/rc14-source-manifest.json`.
 
-The historical reviewed release source commit was `0a1e4616954dea4ec2cd68f7f8a060364e02b9e4` in the private project; that SHA does **not** identify an upstream `llama.cpp` commit.
+The historical reviewed release source commit was `0a1e4616954dea4ec2cd68f7f8a060364e02b9e4` in the private project; that SHA does **not** identify an upstream `llama.cpp` commit. The private project ran against a squashed local snapshot `d5e27e9ba6d62a16cf7caecb7d8763680223127b`; the recovered upstream base is `81bc6b83f827df746eb129235488d325c49cae52`.
 
 ## Licensing
 
