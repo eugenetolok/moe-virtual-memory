@@ -66,6 +66,8 @@ The private research branch investigates executable mathematical expert programs
 
 ## Acknowledgements and licensing
 
-Built as modifications to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The upstream project and its dependencies retain their own license requirements. A public code mirror alone does **not** grant a license to reuse original project-specific code; [source and license notes](docs/provenance.md) document what remains to be finalized before broad redistribution.
+Project-specific code in this repository is licensed under the [MIT License](LICENSE). It is built as modifications to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), whose copyright and license notices remain in force. Release archives must preserve the exact upstream license from the pinned source tree; see [third-party notices](THIRD_PARTY_NOTICES.md) and [source provenance](docs/provenance.md).
+
+Model weights are not included and remain subject to their own licenses.
 
 Contributions and independent reproduction reports are welcome. Please include the model SHA, system configuration, chosen profile, complete timing methodology and any observed swap.
