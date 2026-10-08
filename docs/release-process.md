@@ -2,7 +2,7 @@
 
 A GitHub Actions build is not necessarily a **validated inference release**. Before creating a public version tag and promoting it:
 
-- [ ] Confirm the project's chosen distribution license and preserve upstream dependency notices.
+- [x] Project-specific code is MIT-licensed; preserve the exact upstream license and dependency notices in every release package.
 - [ ] Pin exactly one upstream `llama.cpp` SHA and every imported source patch.
 - [ ] Verify a clean checkout + audited patch reconstruction, both `git apply --check` and `--reverse --check` as appropriate; independently check final source hashes.
 - [ ] Build macOS arm64 binaries; check architecture, deployment target, dylibs, toolchain, SHA-256.
